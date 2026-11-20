@@ -44,7 +44,8 @@ scripts/release.ps1       publier une nouvelle version
    Le script met le numéro de version, crée le commit et le tag `la-taverne-v1.1.0`, puis demande
    avant d'envoyer sur GitHub.
 4. La GitHub Action **Release** construit l'exe, le zippe, le signe et crée la Release.
-   Dans les 10 minutes, les launchers proposent la mise à jour (ou tout de suite avec « Vérifier les mises à jour »).
+   Les launchers vérifient au démarrage puis toutes les heures, et proposent alors la mise à jour
+   (ou tout de suite avec « Vérifier les mises à jour »).
 
 ### Ajouter un nouveau jeu
 

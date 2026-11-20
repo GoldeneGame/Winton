@@ -23,8 +23,8 @@ use std::time::Duration;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = "GoldeneGame/Winton";
 pub const LAUNCHER: &str = "launcher";
-/// Délai entre deux vérifications automatiques (comme Ronnie : 10 min).
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Délai entre deux vérifications automatiques : au démarrage, puis toutes les heures.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// Clé publique Ed25519 (base64) ; la clé privée correspondante est le secret
 /// GitHub `WINTON_UPDATE_KEY`, utilisé par .github/workflows/release.yml.
