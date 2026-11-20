@@ -1,0 +1,106 @@
+# Publie une version quand un tag <composant>-vX.Y.Z est poussé (voir scripts/release.ps1).
+#   launcher-v1.2.0    -> compile launcher/            -> launcher-windows.zip
+#   la-taverne-v1.3.0  -> construit jeux/la-taverne/   -> la-taverne-windows.zip
+# Chaque archive est publiée avec son empreinte (.sha256) et sa signature Ed25519 (.sig),
+# que le launcher vérifie avant d'installer quoi que ce soit.
+name: Release
+
+on:
+  push:
+    tags:
+      - "*-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Composant et version
+        id: meta
+        run: |
+          tag="$GITHUB_REF_NAME"
+          comp="${tag%-v*}"
+          ver="${tag##*-v}"
+          if [ "$comp" = "launcher" ]; then dir=launcher; else dir="jeux/$comp"; fi
+          [ -d "$dir" ] || { echo "::error::Dossier $dir introuvable pour le tag $tag"; exit 1; }
+          [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Version invalide : $ver"; exit 1; }
+          {
+            echo "comp=$comp"
+            echo "ver=$ver"
+            echo "dir=$dir"
+          } >> "$GITHUB_OUTPUT"
+          mkdir -p out/pkg
+
+      # ---------------------------------------------------------------- launcher (Rust)
+      - uses: Swatinem/rust-cache@v2
+        if: steps.meta.outputs.comp == 'launcher'
+        with:
+          workspaces: launcher
+
+      - name: Compiler le launcher
+        if: steps.meta.outputs.comp == 'launcher'
+        working-directory: launcher
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "$v" = "${{ steps.meta.outputs.ver }}" ] || { echo "::error::Cargo.toml indique $v, le tag ${{ steps.meta.outputs.ver }}"; exit 1; }
+          cargo test --release --locked
+          cargo build --release --locked
+          cp target/release/launcher.exe ../out/pkg/Launcher.exe
+
+      # ---------------------------------------------------------------- jeux (Node : npm run build -> dist/)
+      - uses: actions/setup-node@v4
+        if: steps.meta.outputs.comp != 'launcher'
+        with:
+          node-version: "26.13.1"
+
+      - name: Construire le jeu
+        if: steps.meta.outputs.comp != 'launcher'
+        working-directory: ${{ steps.meta.outputs.dir }}
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "$v" = "${{ steps.meta.outputs.ver }}" ] || { echo "::error::package.json indique $v, le tag ${{ steps.meta.outputs.ver }}"; exit 1; }
+          npm ci
+          npm run build
+          cp -r dist/. "$GITHUB_WORKSPACE/out/pkg/"
+          rm -f "$GITHUB_WORKSPACE"/out/pkg/*.ancien-*.exe
+
+      # ---------------------------------------------------------------- archive signée
+      - name: Archive, empreinte et signature
+        env:
+          UPDATE_KEY: ${{ secrets.WINTON_UPDATE_KEY }}
+        run: |
+          [ -n "$UPDATE_KEY" ] || { echo "::error::Le secret WINTON_UPDATE_KEY est manquant (Settings > Secrets and variables > Actions)"; exit 1; }
+          name="${{ steps.meta.outputs.comp }}-windows.zip"
+          pwsh -NoProfile -Command "Compress-Archive -Path out/pkg/* -DestinationPath out/$name"
+          cd out
+          sha256sum "$name" | cut -d' ' -f1 > "$name.sha256"
+          printf '%s\n' "$UPDATE_KEY" > update-key.pem
+          /usr/bin/openssl pkeyutl -sign -inkey update-key.pem -rawin -in "$name" | base64 -w0 > "$name.sig"
+          rm -f update-key.pem
+          [ -s "$name.sig" ] || { echo "::error::Signature vide"; exit 1; }
+          ls -l
+
+      - name: Notes de version (CHANGELOG.md)
+        run: |
+          awk -v v="${{ steps.meta.outputs.ver }}" '
+            /^## / { if (p) exit; p = ($2 == v); next }
+            p { print }
+          ' "${{ steps.meta.outputs.dir }}/CHANGELOG.md" > out/notes.md || true
+          [ -s out/notes.md ] || echo "Version ${{ steps.meta.outputs.ver }}" > out/notes.md
+          cat out/notes.md
+
+      - name: Publier la Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${{ steps.meta.outputs.comp }}-windows.zip"
+          gh release create "$GITHUB_REF_NAME" "out/$name" "out/$name.sha256" "out/$name.sig" \
+            --title "${{ steps.meta.outputs.comp }} ${{ steps.meta.outputs.ver }}" \
+            --notes-file out/notes.md

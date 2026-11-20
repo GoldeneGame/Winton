@@ -1,0 +1,21 @@
+# Compilation Rust
+launcher/target/
+
+# Node
+node_modules/
+
+# Constructions et fichiers générés
+dist/
+build/
+
+# Données personnelles (sauvegardes, mot de passe MJ, bibliothèque du launcher)
+data/
+config.json
+LauncherData/
+
+# Binaires téléchargés
+cloudflared.exe
+
+# Clés : la clé privée de signature ne doit JAMAIS être dans le dépôt
+*.pem
+*.key

@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>La Taverne — JDR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Crimson+Pro:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============================== CONNEXION -->
+<section id="login" class="login">
+  <div class="login-card">
+    <h1>⚔ La Taverne</h1>
+    <p class="sub">Table de jeu de rôle</p>
+    <div class="login-tabs">
+      <button type="button" data-login="player" class="active">Joueur</button>
+      <button type="button" data-login="mj">Maître du jeu</button>
+    </div>
+    <form id="form-player">
+      <label>Nom de ton personnage
+        <input id="in-name" maxlength="40" required autocomplete="off" placeholder="ex : Thorin Écu-de-Chêne">
+      </label>
+      <button class="primary">Entrer dans l'aventure</button>
+      <p class="hint">Si ce personnage existe déjà, tu retrouves sa fiche.</p>
+    </form>
+    <form id="form-mj" hidden>
+      <label>Mot de passe du MJ
+        <input id="in-pass" type="password" required>
+      </label>
+      <button class="primary">Prendre place derrière l'écran</button>
+    </form>
+    <p id="login-error" class="error"></p>
+  </div>
+</section>
+
+<!-- ============================== APPLICATION -->
+<section id="app" hidden>
+  <header class="topbar">
+    <span class="brand">⚔ La Taverne</span>
+    <span id="scene-title" class="scene-title"></span>
+    <span class="spacer"></span>
+    <span id="mj-status" class="pill"></span>
+    <span id="me-label" class="me"></span>
+    <span id="conn" class="conn" title="Connexion"></span>
+    <button id="btn-logout" class="small">Quitter</button>
+  </header>
+
+  <main class="layout">
+    <!-- Carte -->
+    <section class="map-wrap">
+      <div class="map-toolbar">
+        <button id="zoom-out" class="small" title="Dézoomer">−</button>
+        <span id="zoom-val">100%</span>
+        <button id="zoom-in" class="small" title="Zoomer">+</button>
+        <button id="zoom-fit" class="small">Ajuster</button>
+        <span class="muted hint-drag">Glisse ton pion pour te déplacer · Ctrl + molette pour zoomer</span>
+        <button id="map-edit" class="small mj-only map-edit-btn" title="Peindre le sol et poser du décor (battle map)">🖌 Éditer la carte</button>
+      </div>
+      <div id="map-viewport" class="map-viewport">
+        <div id="map" class="map">
+          <img id="map-img" alt="" hidden draggable="false">
+          <canvas id="map-tiles" class="map-tiles" hidden></canvas>
+          <div id="map-grid" class="map-grid"></div>
+          <div id="map-cursor" class="map-cursor" hidden></div>
+          <div id="tokens" class="tokens"></div>
+        </div>
+      </div>
+
+      <!-- Éditeur de battle map (MJ) -->
+      <div id="map-editor" class="map-editor mj-only" hidden>
+        <div class="me-head">
+          <strong>🖌 Éditeur de carte</strong>
+          <span id="me-scene" class="muted grow"></span>
+          <button id="me-close" class="small primary">Terminer</button>
+        </div>
+        <p id="me-none" class="muted tiny">Aucune carte affichée : crée une battle map ci-dessous (ou affiche une carte importée pour peindre dessus).</p>
+        <div id="me-tools">
+          <div class="me-row">
+            <button type="button" class="chip" data-outil="pinceau" title="Peindre case par case">🖌 Pinceau</button>
+            <button type="button" class="chip" data-outil="rect" title="Glisser pour remplir un rectangle (salles, couloirs)">▭ Rectangle</button>
+            <button type="button" class="chip" data-outil="remplir" title="Remplir toute une zone identique">🪣 Remplir</button>
+            <span id="me-brush" class="me-sizes">
+              <button type="button" class="chip" data-taille="1">1</button><button type="button" class="chip" data-taille="2">2</button><button type="button" class="chip" data-taille="3">3</button>
+            </span>
+          </div>
+          <div class="me-label">Sol <button type="button" class="chip tiny-chip" data-calque-gomme="sol">Gomme</button></div>
+          <div id="me-sols" class="tile-grid"></div>
+          <div class="me-label">Décor <button type="button" class="chip tiny-chip" data-calque-gomme="deco">Gomme</button></div>
+          <div id="me-decos" class="tile-grid"></div>
+          <p class="muted tiny"><span id="me-current"></span> · clic droit = effacer</p>
+          <div id="me-battle" class="col">
+            <label class="check">Fond <select id="me-fond"></select></label>
+            <form id="me-taille" class="row">
+              <label class="check">Taille <input type="number" id="me-cols" min="4" max="100" class="w70"> × <input type="number" id="me-rows" min="4" max="100" class="w70"> cases</label>
+              <button class="small">OK</button>
+            </form>
+          </div>
+          <div class="row">
+            <button type="button" id="me-clear-sol" class="small">Effacer le sol</button>
+            <button type="button" id="me-clear-deco" class="small">Effacer le décor</button>
+          </div>
+        </div>
+        <details id="me-create">
+          <summary>➕ Nouvelle battle map</summary>
+          <form id="bm-form" class="col">
+            <input id="bm-titre" placeholder="Titre (ex : Embuscade dans les bois)" maxlength="60">
+            <div class="row">
+              <label class="check"><input type="number" id="bm-cols" min="4" max="100" value="20" class="w70"> × <input type="number" id="bm-rows" min="4" max="100" value="14" class="w70"> cases</label>
+            </div>
+            <label class="check">Fond <select id="bm-fond"></select></label>
+            <button class="primary">Créer et afficher</button>
+          </form>
+        </details>
+      </div>
+      <div id="dice-tray" class="dice-tray"></div>
+      <div id="party" class="party"></div>
+    </section>
+
+    <!-- Panneau latéral -->
+    <aside class="side">
+      <nav class="side-tabs">
+        <button data-tab="chat" class="active">Journal</button>
+        <button data-tab="fiche">Fiche</button>
+        <button data-tab="pion">Pion</button>
+        <button data-tab="init">Initiative</button>
+        <button data-tab="slides" class="mj-only">Slides</button>
+        <button data-tab="mj" class="mj-only">MJ</button>
+      </nav>
+
+      <!-- Journal / dés -->
+      <div class="tab" id="tab-chat">
+        <div id="log" class="log"></div>
+        <div class="dice-picker">
+          <div class="dice-bar" id="dice-bar" title="Clic : ajouter un dé · Clic droit : en retirer un"></div>
+          <div class="row dice-opts">
+            <span class="muted tiny">Bonus</span>
+            <button type="button" id="mod-minus" class="tiny-btn">−</button>
+            <span id="pool-mod" class="pool-mod">+0</span>
+            <button type="button" id="mod-plus" class="tiny-btn">+</button>
+            <span class="spacer"></span>
+            <button type="button" data-adv="kh" class="tiny-btn" title="2d20, on garde le meilleur">Avantage</button>
+            <button type="button" data-adv="kl" class="tiny-btn" title="2d20, on garde le pire">Désavantage</button>
+          </div>
+          <form id="roll-form" class="row">
+            <input id="roll-formula" placeholder="Choisis tes dés ci-dessus (ou écris 1d8+3)" autocomplete="off">
+            <button type="button" id="roll-clear" class="tiny-btn" title="Vider">✕</button>
+            <button class="primary roll-btn">🎲 Lancer</button>
+          </form>
+          <div class="row dice-opts">
+            <label class="check tiny" title="Seul le MJ verra le résultat"><input type="checkbox" id="roll-secret"> Jet secret</label>
+            <span class="spacer"></span>
+            <label class="check tiny"><input type="checkbox" id="opt-anim" checked> Animation</label>
+            <label class="check tiny"><input type="checkbox" id="opt-sound" checked> Son</label>
+          </div>
+        </div>
+        <form id="chat-form" class="row">
+          <select id="chat-to" title="Destinataire"></select>
+          <input id="chat-input" placeholder="Message… (/r 1d20+2 pour lancer)" autocomplete="off" maxlength="2000">
+          <button>Envoyer</button>
+        </form>
+        <label class="check mj-only narr"><input type="checkbox" id="chat-narr"> Message de narration (encadré, pour tous)</label>
+      </div>
+
+      <!-- Fiche -->
+      <div class="tab" id="tab-fiche" hidden>
+        <div class="mj-only row">
+          <select id="fiche-select"></select>
+          <button id="fiche-delete" class="danger small" title="Supprimer ce personnage">Supprimer</button>
+        </div>
+        <p id="sheet-empty" class="muted">Aucun personnage pour l'instant. Les joueurs créent leur personnage en se connectant.</p>
+        <div id="sheet" class="sheet">
+          <div class="sheet-id">
+            <input data-field="name" class="sheet-name" maxlength="40" title="Nom (sert à te reconnecter)">
+            <input data-field="couleur" type="color" title="Couleur du pion">
+          </div>
+          <div class="grid3">
+            <label>Race<input data-field="race" maxlength="40"></label>
+            <label>Classe<input data-field="classe" maxlength="40"></label>
+            <label>Niveau<input data-field="niveau" type="number" min="1" max="30"></label>
+            <label>Alignement<input data-field="alignement" maxlength="40"></label>
+            <label>Historique<input data-field="historique" maxlength="60"></label>
+            <label>XP<input data-field="xp" type="number" min="0"></label>
+          </div>
+
+          <div class="combat">
+            <div class="box hpbox">
+              <span class="box-title">Points de vie</span>
+              <div class="hp-line"><input data-field="pv" type="number"> / <input data-field="pvMax" type="number" min="1"></div>
+              <label class="small-label">Temporaires <input data-field="pvTemp" type="number" min="0"></label>
+              <div class="row dmg">
+                <input id="dmg-amount" type="number" min="1" placeholder="0">
+                <button id="btn-dmg" class="danger small">Dégâts</button>
+                <button id="btn-heal" class="ok small">Soins</button>
+              </div>
+            </div>
+            <div class="box"><span class="box-title">CA</span><input data-field="ca" type="number" class="big"></div>
+            <div class="box"><span class="box-title">Initiative</span><button id="calc-init" class="big-btn" title="Lancer l'initiative"></button></div>
+            <div class="box"><span class="box-title">Vitesse (m)</span><input data-field="vitesse" type="number" class="big"></div>
+            <div class="box"><span class="box-title">Maîtrise</span><span id="calc-maitrise" class="big-val"></span></div>
+            <div class="box"><span class="box-title">Pièces d'or</span><input data-field="po" type="number" class="big"></div>
+          </div>
+
+          <div id="stats" class="stats"></div>
+          <p class="muted tiny">Clique sur un modificateur pour faire un jet (d20 + mod).</p>
+
+          <label class="area">Compétences & maîtrises<textarea data-field="competences" rows="3"></textarea></label>
+          <label class="area">Inventaire & équipement<textarea data-field="inventaire" rows="4"></textarea></label>
+          <label class="area">Sorts & capacités<textarea data-field="sorts" rows="4"></textarea></label>
+          <label class="area">Notes<textarea data-field="notes" rows="4"></textarea></label>
+        </div>
+      </div>
+
+      <!-- Éditeur de pion -->
+      <div class="tab" id="tab-pion" hidden>
+        <div class="mj-only row"><select id="pion-select" title="Pion à modifier"></select></div>
+        <p id="pion-empty" class="muted">Aucun pion à personnaliser.</p>
+        <div id="pion-editor" class="pion-editor">
+          <div class="pion-preview">
+            <div id="pion-preview"></div>
+            <span id="pion-preview-name" class="pion-preview-name"></span>
+          </div>
+
+          <div class="mj-only grid2">
+            <label>Nom<input id="pion-label" maxlength="30"></label>
+            <label>Taille
+              <select id="pion-taille">
+                <option value="1">Moyen (1 case)</option><option value="2">Grand (2×2)</option>
+                <option value="3">Très grand (3×3)</option><option value="4">Gigantesque (4×4)</option>
+              </select>
+            </label>
+          </div>
+
+          <h3>Visage du pion</h3>
+          <div class="seg" id="pion-contenu">
+            <button data-contenu="figurine">Personnage</button>
+            <button data-contenu="embleme">Emblème</button>
+            <button data-contenu="image">Portrait</button>
+            <button data-contenu="initiales">Initiales</button>
+          </div>
+
+          <div id="pion-figurine" class="fig-editor">
+            <div class="fig-label">Modèles</div>
+            <div id="fig-modeles" class="chips"></div>
+            <button type="button" id="fig-random" class="small">🎲 Personnage aléatoire</button>
+            <div id="fig-options" class="fig-options"></div>
+          </div>
+
+          <div id="pion-emblemes" class="emblemes"></div>
+
+          <div id="pion-image-zone" class="col">
+            <label class="file-btn">📷 Importer une image…<input type="file" id="pion-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label>
+            <div id="cropper" class="cropper" hidden>
+              <canvas id="crop-canvas" width="240" height="240"></canvas>
+              <label class="check">Zoom <input type="range" id="crop-zoom" min="1" max="4" step="0.01" value="1"></label>
+              <p class="tiny muted">Glisse l'image pour la cadrer dans le cercle.</p>
+              <div class="row">
+                <button id="crop-cancel" class="small">Annuler</button>
+                <button id="crop-ok" class="primary">Utiliser ce portrait</button>
+              </div>
+            </div>
+          </div>
+
+          <label class="check">Couleur de fond <input type="color" id="pion-couleur"></label>
+
+          <h3>Forme</h3>
+          <div id="pion-formes" class="choices"></div>
+
+          <h3>Cadre</h3>
+          <div id="pion-cadres" class="choices"></div>
+        </div>
+      </div>
+
+      <!-- Initiative -->
+      <div class="tab" id="tab-init" hidden>
+        <div class="init-head">
+          <strong id="init-round">Round 1</strong>
+          <button id="init-roll" class="primary player-only">🎲 Lancer mon initiative</button>
+        </div>
+        <ol id="init-list" class="init-list"></ol>
+        <p id="init-empty" class="muted">Aucun combattant. Les joueurs lancent leur initiative, le MJ ajoute les monstres.</p>
+        <div class="mj-only init-mj">
+          <div class="row">
+            <button id="init-prev">◀ Précédent</button>
+            <button id="init-next" class="primary">Tour suivant ▶</button>
+          </div>
+          <form id="init-form" class="row">
+            <input id="init-name" placeholder="Nom (ex : Orque)" required maxlength="30">
+            <input id="init-val" type="number" placeholder="Init (vide = d20)">
+            <label class="check"><input type="checkbox" id="init-hidden"> Caché</label>
+            <button>Ajouter</button>
+          </form>
+          <button id="init-clear" class="danger small">Terminer le combat</button>
+        </div>
+      </div>
+
+      <!-- Diaporamas du MJ -->
+      <div class="tab" id="tab-slides" hidden>
+        <div class="row">
+          <select id="deck-select" title="Diaporama"></select>
+          <button id="deck-new" class="small" title="Nouveau diaporama">＋ Nouveau</button>
+          <button id="deck-delete" class="danger small" title="Supprimer ce diaporama">✕</button>
+        </div>
+        <p id="deck-empty" class="muted">Crée un diaporama pour préparer tes slides : intro de séance, lieux, PNJ, révélations…</p>
+
+        <div id="deck-editor" class="col">
+          <input id="deck-titre" class="deck-titre" maxlength="80" placeholder="Titre du diaporama">
+
+          <!-- Génération par l'IA -->
+          <details id="ia-box" class="ia-box" open>
+            <summary>✨ Générer des slides avec l'IA</summary>
+            <div id="ia-off" class="muted tiny">
+              Pour activer la génération, ajoute ta clé API Anthropic dans <code>config.json</code>
+              (<code>"cleApiAnthropic": "sk-ant-…"</code>) puis relance l'application.
+              Tu peux toujours créer tes slides à la main ci-dessous.
+            </div>
+            <form id="ia-form" class="col">
+              <textarea id="ia-prompt" rows="3" maxlength="2000" placeholder="Ex : les héros arrivent de nuit au village de Brumeval, tous les habitants ont disparu, seule la taverne est éclairée…"></textarea>
+              <div class="row wrap">
+                <label class="check">Slides <input id="ia-nombre" type="number" min="1" max="10" value="3" class="w70"></label>
+                <select id="ia-ton" title="Ton">
+                  <option value="">Ton libre</option><option>épique</option><option>sombre et inquiétant</option>
+                  <option>mystérieux</option><option>héroïque</option><option>humoristique</option><option>horrifique</option>
+                </select>
+                <label class="check" title="L'IA connaît les noms, races et classes des personnages"><input type="checkbox" id="ia-groupe" checked> Inclure le groupe</label>
+              </div>
+              <button id="ia-go" class="primary">✨ Générer</button>
+              <p id="ia-status" class="muted tiny"></p>
+            </form>
+          </details>
+
+          <div class="row">
+            <strong class="grow">Slides</strong>
+            <button id="slide-add" class="small">＋ Slide</button>
+            <button id="deck-present" class="primary small">▶ Projeter</button>
+          </div>
+          <ol id="slide-list" class="slide-list"></ol>
+
+          <!-- Édition de la slide sélectionnée -->
+          <div id="slide-editor" class="slide-editor">
+            <div id="slide-preview" class="slide-preview"></div>
+            <label class="area">Titre<input id="slide-titre" maxlength="120"></label>
+            <label class="area">Texte lu aux joueurs<textarea id="slide-texte" rows="5" maxlength="3000"></textarea></label>
+            <div class="fig-label">Thème</div>
+            <div id="slide-styles" class="chips"></div>
+            <div class="fig-label">Image</div>
+            <div class="row wrap">
+              <label class="file-btn small-file">📷 Importer…<input type="file" id="slide-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden></label>
+              <select id="slide-scene" title="Reprendre une carte déjà importée"><option value="">— ou une carte —</option></select>
+              <button id="slide-noimg" class="small">Sans image</button>
+            </div>
+            <div class="row">
+              <button id="slide-up" class="small" title="Monter">▲</button>
+              <button id="slide-down" class="small" title="Descendre">▼</button>
+              <span class="spacer"></span>
+              <button id="slide-delete" class="danger small">Supprimer</button>
+              <button id="slide-show" class="primary small">▶ Projeter celle-ci</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Outils du MJ -->
+      <div class="tab" id="tab-mj" hidden>
+        <h3>Inviter les joueurs</h3>
+        <div id="links" class="links"></div>
+
+        <h3>Cartes & scènes</h3>
+        <form id="scene-form" class="col">
+          <input id="scene-titre" placeholder="Titre (ex : La crypte oubliée)" maxlength="60">
+          <div class="row">
+            <input type="file" id="scene-file" accept="image/png,image/jpeg,image/webp,image/gif" required>
+            <button class="primary">Ajouter</button>
+          </div>
+        </form>
+        <ul id="scene-list" class="list"></ul>
+        <div class="row">
+          <button id="mj-battlemap" class="small">🗺 Créer une battle map</button>
+          <button id="scene-none" class="small">Afficher un fond vierge</button>
+        </div>
+
+        <h3>Grille</h3>
+        <div class="row">
+          <label class="check"><input type="checkbox" id="grid-on"> Afficher la grille</label>
+          <label class="check">Case <input type="number" id="grid-size" min="10" max="400" class="w70"> px</label>
+        </div>
+
+        <h3>Pions (monstres, PNJ…)</h3>
+        <form id="token-form" class="row wrap">
+          <input id="token-name" placeholder="Nom (ex : Gobelin 1)" required maxlength="30">
+          <input type="color" id="token-color" value="#8b1e1e">
+          <select id="token-size">
+            <option value="1">Moyen</option><option value="2">Grand</option>
+            <option value="3">Très grand</option><option value="4">Gigantesque</option>
+          </select>
+          <label class="check"><input type="checkbox" id="token-hidden"> Caché</label>
+          <button class="primary">Ajouter</button>
+        </form>
+        <ul id="token-list" class="list"></ul>
+
+        <h3>Partie</h3>
+        <button id="log-clear" class="danger small">Effacer le journal</button>
+      </div>
+    </aside>
+  </main>
+</section>
+
+<!-- Projection d'une slide (tout le monde) -->
+<div id="projection" class="projection" hidden>
+  <div id="projection-slide" class="slide-wrap"></div>
+  <div class="projection-bar">
+    <span id="projection-count" class="projection-count"></span>
+    <span class="spacer"></span>
+    <span class="mj-only row">
+      <button id="proj-prev" class="small">◀ Précédente</button>
+      <button id="proj-next" class="primary small">Suivante ▶</button>
+      <button id="proj-stop" class="danger small">■ Arrêter</button>
+    </span>
+    <button id="proj-hide" class="small" title="Échap">Réduire</button>
+  </div>
+</div>
+<button id="projection-pill" class="projection-pill" hidden>📽 Présentation en cours — afficher</button>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="vendor/socket.io.min.js"></script>
+<script src="figurine.js"></script>
+<script src="dice.js"></script>
+<script src="app.js"></script>
+<script src="battlemap.js"></script>
+<script src="slides.js"></script>
+</body>
+</html>

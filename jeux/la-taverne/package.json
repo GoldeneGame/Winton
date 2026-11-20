@@ -1,0 +1,21 @@
+{
+  "name": "taverne-jdr",
+  "version": "1.0.0",
+  "description": "Table de jeu de rôle en ligne (MJ + joueurs), hébergée sur le PC du MJ",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.12.0",
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "esbuild": "^0.28.2",
+    "rcedit": "^5.0.2"
+  }
+}
