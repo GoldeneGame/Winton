@@ -1,6 +1,12 @@
-# Changelog — Launcher
+# Changelog — Winton
 
 Les nouveautés de chaque version sont affichées dans le launcher avant la mise à jour.
+
+## 1.1.0
+- Le launcher s'appelle désormais Winton, avec son nouveau logo : un écu rouge et or frappé d'un W.
+- La Taverne s'installe et se met à jour depuis ses releases GitHub : un bouton « Mettre à jour Winton » apparaît dès qu'une nouvelle version est publiée.
+- Rejoindre une partie par le lien du MJ, ou héberger la partie (MJ).
+- Un petit dragon traverse la fenêtre de temps en temps.
 
 ## 1.0.0
 - Bibliothèque de jeux : jaquettes, icônes, temps de jeu, recherche, tri.

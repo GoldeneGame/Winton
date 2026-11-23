@@ -173,6 +173,7 @@ pub struct LauncherApp {
     last_check: Option<Instant>,
     upd_tx: Sender<UpdMsg>,
     upd_rx: Receiver<UpdMsg>,
+    dragon: crate::dragon::Dragon,
 }
 
 impl LauncherApp {
@@ -190,6 +191,7 @@ impl LauncherApp {
             last_check: None,
             upd_tx,
             upd_rx,
+            dragon: crate::dragon::Dragon::new(),
             store,
             data,
             selected: None,
@@ -1486,6 +1488,7 @@ impl eframe::App for LauncherApp {
                 .rect_filled(ctx.screen_rect(), 0.0, Color32::from_black_alpha(150));
         }
         self.show_modal(ctx);
+        self.dragon.show(ctx, modal_open);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));

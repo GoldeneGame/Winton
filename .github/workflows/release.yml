@@ -53,7 +53,7 @@ jobs:
           [ "$v" = "${{ steps.meta.outputs.ver }}" ] || { echo "::error::Cargo.toml indique $v, le tag ${{ steps.meta.outputs.ver }}"; exit 1; }
           cargo test --release --locked
           cargo build --release --locked
-          cp target/release/launcher.exe ../out/pkg/Launcher.exe
+          cp target/release/winton.exe ../out/pkg/Winton.exe
 
       # ---------------------------------------------------------------- jeux (Node : npm run build -> dist/)
       - uses: actions/setup-node@v4

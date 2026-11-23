@@ -1,8 +1,11 @@
 [package]
 name = "winton"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Winton, launcher de jeux"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 eframe = "=0.29.1"

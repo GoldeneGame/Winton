@@ -1,12 +1,22 @@
 // Intègre l'icône dans Winton.exe (Explorateur, raccourcis, barre des tâches).
-// windres est appelé directement, avec des chemins relatifs : il gère mal les
-// espaces dans le chemin du projet (« Projet Claude »).
+//  - MSVC (GitHub Actions) : winresource, qui trouve rc.exe tout seul ;
+//  - MinGW (ce PC) : windres est appelé directement, avec des chemins relatifs,
+//    car il gère mal les espaces dans le chemin du projet (« Projet Claude »).
 use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=assets/winton.ico");
     println!("cargo:rerun-if-changed=build.rs");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/winton.ico")
+            .set("ProductName", "Winton")
+            .set("FileDescription", "Winton")
+            .set("OriginalFilename", "Winton.exe");
+        res.compile().expect("impossible d'intégrer l'icône");
         return;
     }
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());

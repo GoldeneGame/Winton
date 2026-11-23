@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"] // pas de fenêtre console
 
 mod app;
+mod dragon;
 mod model;
 mod theme;
 mod updater;
