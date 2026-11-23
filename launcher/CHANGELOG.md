@@ -2,6 +2,9 @@
 
 Les nouveautés de chaque version sont affichées dans le launcher avant la mise à jour.
 
+## 1.1.1
+- La Taverne, installée et mise à jour par Winton, ne peut plus être retirée du launcher ni voir ses chemins modifiés (boutons, clic droit, F2 et Suppr).
+
 ## 1.1.0
 - Le launcher s'appelle désormais Winton, avec son nouveau logo : un écu rouge et or frappé d'un W.
 - La Taverne s'installe et se met à jour depuis ses releases GitHub : un bouton « Mettre à jour Winton » apparaît dès qu'une nouvelle version est publiée.

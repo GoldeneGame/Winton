@@ -216,6 +216,11 @@ impl LauncherApp {
         self.data.games.iter().find(|g| g.id == id)
     }
 
+    /// Jeu installé et tenu à jour par Winton (La Taverne) : verrouillé.
+    fn is_managed(&self, id: &str) -> bool {
+        self.game(id).is_some_and(|g| g.source.is_some())
+    }
+
     /// Action du double-clic, du sceau et de la touche Entrée : pour un jeu en ligne c'est
     /// « Rejoindre » (un joueur ne doit pas lancer le serveur par mégarde), sinon « Jouer ».
     fn primary_action(&self, id: &str) -> Action {
@@ -607,6 +612,8 @@ impl LauncherApp {
                 Action::Launch(id) => self.launch(ctx, &id, false),
                 Action::ForceLaunch(id) => self.launch(ctx, &id, true),
                 Action::Add(path) => self.open_add(path),
+                // Les jeux gérés par Winton ne se modifient ni ne se retirent (F2, Suppr, menus…).
+                Action::Edit(id) | Action::ConfirmRemove(id) | Action::Remove(id) if self.is_managed(&id) => {}
                 Action::Edit(id) => self.open_edit(&id),
                 Action::ConfirmRemove(id) => self.modal = Modal::ConfirmRemove(id),
                 Action::Remove(id) => self.remove(&id),
@@ -888,9 +895,11 @@ impl LauncherApp {
                             });
                         ui.add_space(10.0);
 
+                        // Jeu géré par Winton : ni modification de ses chemins, ni retrait.
+                        let locked = g.source.is_some();
                         ui.horizontal(|ui| {
-                            let bw = (w - 16.0) / 3.0;
-                            if ui.add_sized([bw, 34.0], Button::new("Modifier")).on_hover_text("F2").clicked() {
+                            let bw = if locked { w } else { (w - 16.0) / 3.0 };
+                            if !locked && ui.add_sized([bw, 34.0], Button::new("Modifier")).on_hover_text("F2").clicked() {
                                 self.actions.push(Action::Edit(g.id.clone()));
                             }
                             if ui
@@ -900,7 +909,8 @@ impl LauncherApp {
                             {
                                 self.actions.push(Action::Folder(g.id.clone()));
                             }
-                            if ui.add_sized([bw, 34.0], theme::danger_button("Retirer")).on_hover_text("Suppr").clicked()
+                            if !locked
+                                && ui.add_sized([bw, 34.0], theme::danger_button("Retirer")).on_hover_text("Suppr").clicked()
                             {
                                 self.actions.push(Action::ConfirmRemove(g.id.clone()));
                             }
@@ -1150,17 +1160,21 @@ impl LauncherApp {
             self.actions.push(Action::Select(id.clone()));
         }
         let joinable = self.data.games[index].joinable();
+        let locked = self.data.games[index].source.is_some();
         resp.context_menu(|ui| {
             if joinable && ui.button("Rejoindre une partie…").clicked() {
                 self.actions.push(Action::AskJoin(id.clone()));
                 ui.close_menu();
             }
-            let items = [
+            let mut items = vec![
                 (if joinable { "Héberger la partie (MJ)" } else { "Jouer" }, Action::Launch(id.clone())),
                 ("Modifier…", Action::Edit(id.clone())),
                 ("Ouvrir l'emplacement du jeu", Action::Folder(id.clone())),
                 ("Retirer du launcher", Action::ConfirmRemove(id.clone())),
             ];
+            if locked {
+                items.retain(|(_, a)| !matches!(a, Action::Edit(_) | Action::ConfirmRemove(_)));
+            }
             for (label, action) in items {
                 if ui.button(label).clicked() {
                     self.actions.push(action);
