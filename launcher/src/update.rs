@@ -22,7 +22,8 @@ use std::time::Duration;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO: &str = "GoldeneGame/Winton";
-pub const LAUNCHER: &str = "launcher";
+/// Nom du composant launcher dans les Releases (tags winton-vX.Y.Z, archive winton-windows.zip).
+pub const LAUNCHER: &str = "winton";
 /// Délai entre deux vérifications automatiques : au démarrage, puis toutes les heures.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 

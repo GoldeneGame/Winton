@@ -1,5 +1,5 @@
 # Publie une version quand un tag <composant>-vX.Y.Z est poussé (voir scripts/release.ps1).
-#   launcher-v1.2.0    -> compile launcher/            -> launcher-windows.zip
+#   winton-v1.2.0      -> compile launcher/            -> winton-windows.zip
 #   la-taverne-v1.3.0  -> construit jeux/la-taverne/   -> la-taverne-windows.zip
 # Chaque archive est publiée avec son empreinte (.sha256) et sa signature Ed25519 (.sig),
 # que le launcher vérifie avant d'installer quoi que ce soit.
@@ -28,24 +28,25 @@ jobs:
           tag="$GITHUB_REF_NAME"
           comp="${tag%-v*}"
           ver="${tag##*-v}"
-          if [ "$comp" = "launcher" ]; then dir=launcher; else dir="jeux/$comp"; fi
+          if [ "$comp" = "winton" ]; then dir=launcher; else dir="jeux/$comp"; fi
           [ -d "$dir" ] || { echo "::error::Dossier $dir introuvable pour le tag $tag"; exit 1; }
           [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Version invalide : $ver"; exit 1; }
           {
             echo "comp=$comp"
             echo "ver=$ver"
             echo "dir=$dir"
+            if [ "$comp" = "winton" ]; then echo "title=Winton $ver"; else echo "title=$comp $ver"; fi
           } >> "$GITHUB_OUTPUT"
           mkdir -p out/pkg
 
       # ---------------------------------------------------------------- launcher (Rust)
       - uses: Swatinem/rust-cache@v2
-        if: steps.meta.outputs.comp == 'launcher'
+        if: steps.meta.outputs.comp == 'winton'
         with:
           workspaces: launcher
 
       - name: Compiler le launcher
-        if: steps.meta.outputs.comp == 'launcher'
+        if: steps.meta.outputs.comp == 'winton'
         working-directory: launcher
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -56,12 +57,12 @@ jobs:
 
       # ---------------------------------------------------------------- jeux (Node : npm run build -> dist/)
       - uses: actions/setup-node@v4
-        if: steps.meta.outputs.comp != 'launcher'
+        if: steps.meta.outputs.comp != 'winton'
         with:
           node-version: "26.13.1"
 
       - name: Construire le jeu
-        if: steps.meta.outputs.comp != 'launcher'
+        if: steps.meta.outputs.comp != 'winton'
         working-directory: ${{ steps.meta.outputs.dir }}
         run: |
           v=$(node -p "require('./package.json').version")
@@ -102,5 +103,5 @@ jobs:
         run: |
           name="${{ steps.meta.outputs.comp }}-windows.zip"
           gh release create "$GITHUB_REF_NAME" "out/$name" "out/$name.sha256" "out/$name.sig" \
-            --title "${{ steps.meta.outputs.comp }} ${{ steps.meta.outputs.ver }}" \
+            --title "${{ steps.meta.outputs.title }}" \
             --notes-file out/notes.md
