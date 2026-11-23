@@ -6,7 +6,7 @@ un bouton **Mise à jour** apparaît dans le launcher.
 
 ## Installer
 
-1. Télécharge `launcher-windows.zip` dans la dernière [Release du launcher](https://github.com/GoldeneGame/Winton/releases).
+1. Télécharge `winton-windows.zip` dans la dernière [Release de Winton](https://github.com/GoldeneGame/Winton/releases).
 2. Dézippe-le dans un dossier à toi (ex. `Documents\Winton`), puis lance `Launcher.exe`.
 3. Les jeux disponibles apparaissent dans la section **À installer** : clique pour les installer.
 

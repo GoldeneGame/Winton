@@ -2,7 +2,7 @@
   Publie une nouvelle version du launcher ou d'un jeu (équivalent du scripts/release.sh de Ronnie).
 
   Usage (depuis n'importe où) :
-      .\scripts\release.ps1 launcher 1.1.0
+      .\scripts\release.ps1 winton 1.1.0
       .\scripts\release.ps1 la-taverne 1.2.0
 
   Avant : écris les nouveautés dans le CHANGELOG.md du composant, sous un titre « ## 1.2.0 ».
@@ -32,7 +32,8 @@ $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { Stop-Release "la version doit être au format X.Y.Z (ex. 1.2.0)" }
-$dir = if ($Composant -eq 'launcher') { 'launcher' } else { "jeux\$Composant" }
+if ($Composant -eq 'launcher') { $Composant = 'winton' }  # ancien nom
+$dir = if ($Composant -eq 'winton') { 'launcher' } else { "jeux\$Composant" }
 if (-not (Test-Path $dir)) { Stop-Release "le dossier $dir n'existe pas" }
 if ((git branch --show-current) -ne 'main') { Stop-Release "il faut être sur la branche main" }
 $tag = "$Composant-v$Version"
@@ -51,7 +52,7 @@ if ($others) {
 
 # ---------------------------------------------------------------- numéro de version
 $versionRegex = [regex]'"version":\s*"[^"]*"'
-if ($Composant -eq 'launcher') {
+if ($Composant -eq 'winton') {
     $cargo = Join-Path $dir 'Cargo.toml'
     $text = [IO.File]::ReadAllText($cargo)
     Write-Utf8 $cargo ([regex]::new('(?m)^version = "[^"]*"').Replace($text, "version = `"$Version`"", 1))
