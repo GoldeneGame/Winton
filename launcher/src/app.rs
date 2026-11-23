@@ -1,22 +1,61 @@
 //! Interface du launcher.
 
 use crate::model::{self, Game, LauncherData, Store};
-use crate::theme::{self, bold_font, ACCENT, BG, CARD, DANGER, PANEL, PLAY, SUB, TEXT};
-use crate::update::{self, CatalogEntry, Progress, Release, Remote};
+use crate::theme::{
+    self, bold_font, heading_font, title_font, Surface, ACCENT, DANGER, GOLD, GOLD_BRIGHT, GOLD_DIM, INK, INK_SUB,
+    PLAY, RUNNING, SUB, TEXT,
+};
+use crate::updater::{self, Release};
 use crate::win;
 
 use eframe::egui::{
     self, pos2, vec2, Align, Align2, Button, Color32, FontId, Frame, Key, Layout, Margin, Rect, RichText, Rounding,
-    ScrollArea, Sense, Stroke, TextEdit, TextureHandle, Ui,
+    ScrollArea, Sense, Shape, Stroke, TextEdit, TextureHandle, Ui,
 };
+
+/// Peint une texture derrière le contenu d'un panneau, une fois sa taille connue.
+fn textured<R>(
+    ui: &mut Ui,
+    margin: Margin,
+    surface: Surface,
+    use_max: bool,
+    tint: Color32,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> (R, Rect) {
+    let idx = ui.painter().add(Shape::Noop);
+    let r = add(ui);
+    let inner = if use_max { ui.max_rect() } else { ui.min_rect() };
+    let full =
+        Rect::from_min_max(inner.min - vec2(margin.left, margin.top), inner.max + vec2(margin.right, margin.bottom));
+    ui.painter().set(idx, theme::surface_shape(surface, full, tint));
+    (r, full)
+}
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::SeqCst};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const CARD_SIZE: egui::Vec2 = egui::Vec2::new(180.0, 252.0);
+/// Fréquence de vérification des mises à jour des jeux gérés.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(15 * 60);
+
+// ------------------------------------------------------------------ mises à jour
+
+/// État de la mise à jour d'un jeu géré (récupéré depuis les releases GitHub).
+enum Upd {
+    Checking,
+    UpToDate(String),
+    NoRelease,
+    Available(Release),
+    Downloading { tag: String, done: Arc<AtomicU64>, total: u64 },
+    Failed(String),
+}
+
+enum UpdMsg {
+    Checked(String, Result<Option<Release>, String>),
+    Installed(String, String, Result<std::path::PathBuf, String>),
+}
 
 // ------------------------------------------------------------------ images
 
@@ -33,11 +72,6 @@ impl TexCache {
             return None;
         }
         self.get(ctx, "ico", path, win::extract_icon)
-    }
-
-    /// Oublie l'icône d'un fichier (après une mise à jour du jeu).
-    fn forget_icon(&mut self, path: &str) {
-        self.0.remove(&format!("ico:{path}"));
     }
 
     fn get(
@@ -84,16 +118,22 @@ struct EditForm {
     focused: bool,
 }
 
+/// Fenêtre « Rejoindre une partie » : le joueur colle le lien du MJ.
+struct JoinForm {
+    id: String,
+    url: String,
+    error: String,
+    focused: bool,
+}
+
 enum Modal {
     None,
     Edit(EditForm),
+    Join(JoinForm),
     ConfirmRemove(String),
     Missing(String),
     AlreadyRunning(String),
     Message(String, String),
-    /// Installer ou mettre à jour un jeu du catalogue (id du catalogue).
-    InstallGame(String),
-    LauncherUpdate,
 }
 
 enum Action {
@@ -105,24 +145,8 @@ enum Action {
     ConfirmRemove(String),
     Remove(String),
     Folder(String),
-    AskInstall(String),
-    Install(String),
-    AskLauncherUpdate,
-    UpdateLauncher,
-    CheckUpdates,
-}
-
-/// Messages des threads de mise à jour.
-enum UpdateMsg {
-    Checked(Result<Remote, String>),
-    GameInstalled { entry: CatalogEntry, version: String, result: Result<PathBuf, String> },
-    LauncherInstalled(Result<(), String>),
-}
-
-/// Téléchargement en cours (un seul à la fois).
-struct Job {
-    label: String,
-    progress: Arc<Progress>,
+    Update(String),
+    AskJoin(String),
 }
 
 pub struct LauncherApp {
@@ -144,32 +168,35 @@ pub struct LauncherApp {
     hwnd: Arc<AtomicIsize>,
     tx: Sender<(String, f64)>,
     rx: Receiver<(String, f64)>,
-    // Mises à jour
-    auto_update: bool,
-    remote: Option<Remote>,
-    checking: bool,
+    // Jeux gérés : état des mises à jour par id de jeu.
+    updates: HashMap<String, Upd>,
     last_check: Option<Instant>,
-    launcher_dismissed: bool,
-    job: Option<Job>,
-    upd_tx: Sender<UpdateMsg>,
-    upd_rx: Receiver<UpdateMsg>,
+    upd_tx: Sender<UpdMsg>,
+    upd_rx: Receiver<UpdMsg>,
 }
 
 impl LauncherApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup(&cc.egui_ctx);
         let store = Store::new();
-        let (data, warning) = store.load();
+        let (mut data, warning) = store.load();
+        if warning.is_none() && model::attach_managed(&mut data) {
+            let _ = store.save(&data);
+        }
         let (tx, rx) = channel();
         let (upd_tx, upd_rx) = channel();
         LauncherApp {
+            updates: HashMap::new(),
+            last_check: None,
+            upd_tx,
+            upd_rx,
             store,
             data,
             selected: None,
             search: String::new(),
             status: "Astuce : glisse un .exe dans la fenêtre pour l'ajouter.".into(),
             tex: TexCache::default(),
-            modal: warning.map_or(Modal::None, |w| Modal::Message("Launcher".into(), w)),
+            modal: warning.map_or(Modal::None, |w| Modal::Message("Winton".into(), w)),
             actions: Vec::new(),
             pending_adds: VecDeque::new(),
             focus_search: false,
@@ -180,19 +207,21 @@ impl LauncherApp {
             hwnd: Arc::new(AtomicIsize::new(0)),
             tx,
             rx,
-            auto_update: std::env::var_os("WINTON_NO_UPDATE").is_none(),
-            remote: None,
-            checking: false,
-            last_check: None,
-            launcher_dismissed: false,
-            job: None,
-            upd_tx,
-            upd_rx,
         }
     }
 
     fn game(&self, id: &str) -> Option<&Game> {
         self.data.games.iter().find(|g| g.id == id)
+    }
+
+    /// Action du double-clic, du sceau et de la touche Entrée : pour un jeu en ligne c'est
+    /// « Rejoindre » (un joueur ne doit pas lancer le serveur par mégarde), sinon « Jouer ».
+    fn primary_action(&self, id: &str) -> Action {
+        if self.game(id).is_some_and(Game::joinable) {
+            Action::AskJoin(id.to_string())
+        } else {
+            Action::Launch(id.to_string())
+        }
     }
 
     fn save(&mut self) {
@@ -201,15 +230,12 @@ impl LauncherApp {
         }
     }
 
-    fn matches_search(&self, name: &str) -> bool {
-        let q = self.search.trim().to_lowercase();
-        q.is_empty() || name.to_lowercase().contains(&q)
-    }
-
     /// Indices des jeux affichés (recherche + tri).
     fn visible(&self) -> Vec<usize> {
+        let q = self.search.trim().to_lowercase();
         let games = &self.data.games;
-        let mut v: Vec<usize> = (0..games.len()).filter(|&i| self.matches_search(&games[i].name)).collect();
+        let mut v: Vec<usize> =
+            (0..games.len()).filter(|&i| q.is_empty() || games[i].name.to_lowercase().contains(&q)).collect();
         v.sort_by(|&a, &b| {
             let (a, b) = (&games[a], &games[b]);
             let primary = match self.data.sort.as_str() {
@@ -220,177 +246,6 @@ impl LauncherApp {
             primary.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         v
-    }
-
-    // ------------------------------------------------------------------ mises à jour
-
-    fn release(&self, component: &str) -> Option<&Release> {
-        self.remote.as_ref()?.releases.get(component)
-    }
-
-    fn catalog_entry(&self, id: &str) -> Option<&CatalogEntry> {
-        self.remote.as_ref()?.catalog.iter().find(|e| e.id == id)
-    }
-
-    /// Nouvelle version du launcher, s'il y en a une.
-    fn launcher_update(&self) -> Option<&Release> {
-        self.release(update::LAUNCHER).filter(|r| update::is_newer(&r.version, update::VERSION))
-    }
-
-    /// Nouvelle version d'un jeu installé depuis le catalogue, s'il y en a une.
-    fn game_update(&self, g: &Game) -> Option<&Release> {
-        if g.catalog_id.is_empty() {
-            return None;
-        }
-        self.release(&g.catalog_id).filter(|r| g.version.is_empty() || update::is_newer(&r.version, &g.version))
-    }
-
-    /// Jeux du catalogue publiés mais pas encore installés.
-    fn installable(&self) -> Vec<(CatalogEntry, String)> {
-        let Some(remote) = &self.remote else { return Vec::new() };
-        remote
-            .catalog
-            .iter()
-            .filter(|e| !self.data.games.iter().any(|g| g.catalog_id == e.id))
-            .filter(|e| self.matches_search(&e.name))
-            .filter_map(|e| remote.releases.get(&e.id).map(|r| (e.clone(), r.version.clone())))
-            .collect()
-    }
-
-    fn maybe_check(&mut self, ctx: &egui::Context) {
-        if !self.auto_update || self.checking {
-            return;
-        }
-        match self.last_check {
-            Some(t) if t.elapsed() < update::CHECK_INTERVAL => {
-                ctx.request_repaint_after(update::CHECK_INTERVAL.saturating_sub(t.elapsed()));
-            }
-            _ => self.check_now(ctx),
-        }
-    }
-
-    fn check_now(&mut self, ctx: &egui::Context) {
-        if self.checking {
-            return;
-        }
-        self.checking = true;
-        self.last_check = Some(Instant::now());
-        let (tx, ctx) = (self.upd_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(UpdateMsg::Checked(update::fetch_remote()));
-            ctx.request_repaint();
-        });
-    }
-
-    fn start_install(&mut self, ctx: &egui::Context, id: &str) {
-        if self.job.is_some() {
-            return;
-        }
-        let (Some(entry), Some(release)) = (self.catalog_entry(id).cloned(), self.release(id).cloned()) else {
-            return;
-        };
-        if let Some(g) = self.data.games.iter().find(|g| g.catalog_id == id) {
-            if self.running.contains_key(&g.id) {
-                self.modal = Modal::Message(
-                    "Jeu ouvert".into(),
-                    format!("Ferme « {} » avant de le mettre à jour.", g.name),
-                );
-                return;
-            }
-        }
-        let progress = Arc::new(Progress::default());
-        self.job = Some(Job { label: format!("{} {}", entry.name, release.version), progress: progress.clone() });
-        let (tx, ctx, games_dir) = (self.upd_tx.clone(), ctx.clone(), self.store.games_dir());
-        std::thread::spawn(move || {
-            let result = update::install_game(&entry, &release, &games_dir, &progress);
-            let _ = tx.send(UpdateMsg::GameInstalled { entry, version: release.version, result });
-            ctx.request_repaint();
-        });
-    }
-
-    fn start_launcher_update(&mut self, ctx: &egui::Context) {
-        if self.job.is_some() {
-            return;
-        }
-        let Some(release) = self.launcher_update().cloned() else { return };
-        let progress = Arc::new(Progress::default());
-        self.job = Some(Job { label: format!("Launcher {}", release.version), progress: progress.clone() });
-        let (tx, ctx) = (self.upd_tx.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send(UpdateMsg::LauncherInstalled(update::install_launcher(&release, &progress)));
-            ctx.request_repaint();
-        });
-    }
-
-    fn poll_updates(&mut self, ctx: &egui::Context) {
-        while let Ok(msg) = self.upd_rx.try_recv() {
-            match msg {
-                UpdateMsg::Checked(Ok(remote)) => {
-                    self.checking = false;
-                    self.remote = Some(remote);
-                }
-                UpdateMsg::Checked(Err(e)) => {
-                    self.checking = false;
-                    self.status = format!("Mises à jour : vérification impossible ({e}).");
-                }
-                UpdateMsg::GameInstalled { entry, version, result } => {
-                    self.job = None;
-                    match result {
-                        Ok(exe) => self.on_game_installed(&entry, &version, &exe),
-                        Err(e) => {
-                            self.modal = Modal::Message(
-                                "Installation impossible".into(),
-                                format!("« {} » n'a pas pu être installé :\n\n{e}", entry.name),
-                            )
-                        }
-                    }
-                }
-                UpdateMsg::LauncherInstalled(result) => {
-                    self.job = None;
-                    match result.and_then(|_| update::relaunch()) {
-                        Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        Err(e) => {
-                            self.modal = Modal::Message(
-                                "Mise à jour impossible".into(),
-                                format!("Le launcher n'a pas pu être mis à jour :\n\n{e}"),
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        if self.job.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(200));
-        }
-    }
-
-    fn on_game_installed(&mut self, entry: &CatalogEntry, version: &str, exe: &Path) {
-        let exe = exe.to_string_lossy().to_string();
-        self.tex.forget_icon(&exe);
-        let path = model::make_portable(&exe);
-        let id = match self.data.games.iter_mut().find(|g| g.catalog_id == entry.id) {
-            Some(g) => {
-                g.version = version.to_string();
-                g.path = path;
-                self.status = format!("« {} » a été mis à jour en version {version}.", g.name);
-                g.id.clone()
-            }
-            None => {
-                let g = Game {
-                    name: entry.name.clone(),
-                    path,
-                    catalog_id: entry.id.clone(),
-                    version: version.to_string(),
-                    ..Default::default()
-                };
-                self.status = format!("« {} » {version} a été installé.", g.name);
-                let id = g.id.clone();
-                self.data.games.push(g);
-                id
-            }
-        };
-        self.selected = Some(id);
-        self.save();
     }
 
     // ------------------------------------------------------------------ actions
@@ -496,10 +351,10 @@ impl LauncherApp {
         let Some(pos) = self.data.games.iter().position(|g| g.id == id) else { return };
         let g = self.data.games.remove(pos);
         self.store.delete_owned_cover(&g.cover_path);
-        // Jeu du catalogue : on désinstalle ses fichiers (ses sauvegardes sont rangées ailleurs).
-        if !g.catalog_id.is_empty() {
-            let _ = std::fs::remove_dir_all(self.store.games_dir().join(&g.catalog_id));
+        if let Some(s) = &g.source {
+            self.data.removed_managed.push(s.repo.clone());
         }
+        self.updates.remove(id);
         self.status = format!("« {} » a été retiré.", g.name);
         self.save();
     }
@@ -525,6 +380,12 @@ impl LauncherApp {
             if !force && last == id && t.elapsed().as_secs_f32() < 2.0 {
                 return;
             }
+        }
+
+        // Jeu géré pas encore installé : « Jouer » l'installe d'abord.
+        if g.source.is_some() && !g.installed() {
+            self.start_update(ctx, id);
+            return;
         }
 
         let target = g.full_path();
@@ -593,6 +454,29 @@ impl LauncherApp {
         }
     }
 
+    /// Ouvre la partie du MJ dans le navigateur : aucun serveur n'est lancé sur ce PC.
+    /// Renvoie true si la fenêtre « Rejoindre » peut se fermer.
+    fn join(&mut self, f: &mut JoinForm) -> bool {
+        let url = match model::parse_join_url(&f.url) {
+            Ok(u) => u,
+            Err(e) => {
+                f.error = e;
+                return false;
+            }
+        };
+        if let Err(e) = win::shell_launch(&url, "", None) {
+            f.error = format!("Impossible d'ouvrir le navigateur : {e}");
+            return false;
+        }
+        if let Some(g) = self.data.games.iter_mut().find(|g| g.id == f.id) {
+            g.join_url = url;
+            g.last_played = Some(model::now());
+            self.status = format!("Partie de « {} » ouverte dans ton navigateur.", g.name);
+        }
+        self.save();
+        true
+    }
+
     fn poll_finished(&mut self) {
         let mut any = false;
         while let Ok((id, secs)) = self.rx.try_recv() {
@@ -614,6 +498,106 @@ impl LauncherApp {
         }
     }
 
+    // ------------------------------------------------------------------ mises à jour
+
+    /// Interroge GitHub pour chaque jeu géré (en arrière-plan).
+    fn check_updates(&mut self, ctx: &egui::Context) {
+        self.last_check = Some(Instant::now());
+        for g in &self.data.games {
+            let Some(src) = &g.source else { continue };
+            if matches!(self.updates.get(&g.id), Some(Upd::Downloading { .. })) {
+                continue;
+            }
+            self.updates.entry(g.id.clone()).or_insert(Upd::Checking);
+            let (id, repo, asset, tx, ctx) = (g.id.clone(), src.repo.clone(), src.asset.clone(), self.upd_tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(UpdMsg::Checked(id, updater::latest(&repo, &asset)));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn poll_updates(&mut self) {
+        while let Ok(msg) = self.upd_rx.try_recv() {
+            match msg {
+                UpdMsg::Checked(id, result) => {
+                    let Some(g) = self.game(&id) else { continue };
+                    if matches!(self.updates.get(&id), Some(Upd::Downloading { .. })) {
+                        continue;
+                    }
+                    let version = g.source.as_ref().map(|s| s.version.clone()).unwrap_or_default();
+                    let state = match result {
+                        Ok(None) => Upd::NoRelease,
+                        Ok(Some(r)) if r.tag == version && g.installed() => Upd::UpToDate(r.tag),
+                        Ok(Some(r)) => Upd::Available(r),
+                        Err(e) => Upd::Failed(e),
+                    };
+                    self.updates.insert(id, state);
+                }
+                UpdMsg::Installed(id, tag, result) => match result {
+                    Ok(exe) => {
+                        if let Some(g) = self.data.games.iter_mut().find(|g| g.id == id) {
+                            g.path = model::make_portable(&exe.to_string_lossy());
+                            if let Some(s) = g.source.as_mut() {
+                                s.version = tag.clone();
+                            }
+                            self.status = format!("« {} » est à jour ({tag}).", g.name);
+                        }
+                        self.updates.insert(id, Upd::UpToDate(tag));
+                        self.save();
+                    }
+                    Err(e) => {
+                        let name = self.game(&id).map(|g| g.name.clone()).unwrap_or_default();
+                        self.updates.insert(id, Upd::Failed(e.clone()));
+                        self.modal = Modal::Message("Mise à jour impossible".into(), format!("« {name} » n'a pas pu être installé :\n\n{e}"));
+                    }
+                },
+            }
+        }
+    }
+
+    /// Télécharge et installe la dernière version d'un jeu géré.
+    fn start_update(&mut self, ctx: &egui::Context, id: &str) {
+        let Some(g) = self.game(id).cloned() else { return };
+        let Some(src) = g.source.clone() else { return };
+        if self.running.contains_key(id) {
+            self.modal = Modal::Message("Jeu en cours".into(), format!("Ferme « {} » avant de le mettre à jour.", g.name));
+            return;
+        }
+        let rel = match self.updates.get(id) {
+            Some(Upd::Available(r)) => r.clone(),
+            Some(Upd::Downloading { .. }) => return,
+            Some(Upd::Checking) | None => {
+                self.status = "Recherche de la dernière version… réessaie dans un instant.".into();
+                return;
+            }
+            Some(Upd::NoRelease) => {
+                self.modal = Modal::Message(
+                    "Pas encore disponible".into(),
+                    format!("Aucune version de « {} » n'a encore été publiée sur GitHub ({}).", g.name, src.repo),
+                );
+                return;
+            }
+            Some(Upd::Failed(e)) => {
+                self.modal = Modal::Message("Mise à jour impossible".into(), e.clone());
+                self.check_updates(ctx);
+                return;
+            }
+            Some(Upd::UpToDate(_)) => return,
+        };
+        let done = Arc::new(AtomicU64::new(0));
+        self.updates.insert(id.to_string(), Upd::Downloading { tag: rel.tag.clone(), done: done.clone(), total: rel.size });
+        self.status = format!("Téléchargement de « {} » {}…", g.name, rel.tag);
+        let dir = self.store.game_dir(&src.repo);
+        let previous = g.installed().then(|| std::path::PathBuf::from(g.full_path()));
+        let (id, tx, ctx) = (id.to_string(), self.upd_tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = updater::install(&rel, &src.asset, &dir, previous, &done);
+            let _ = tx.send(UpdMsg::Installed(id, rel.tag, result));
+            ctx.request_repaint();
+        });
+    }
+
     fn process_actions(&mut self, ctx: &egui::Context) {
         for action in std::mem::take(&mut self.actions) {
             match action {
@@ -625,19 +609,11 @@ impl LauncherApp {
                 Action::ConfirmRemove(id) => self.modal = Modal::ConfirmRemove(id),
                 Action::Remove(id) => self.remove(&id),
                 Action::Folder(id) => self.open_folder(&id),
-                Action::AskInstall(id) => {
-                    if self.job.is_none() {
-                        self.modal = Modal::InstallGame(id)
-                    }
+                Action::Update(id) => self.start_update(ctx, &id),
+                Action::AskJoin(id) => {
+                    let url = self.game(&id).map(|g| g.join_url.clone()).unwrap_or_default();
+                    self.modal = Modal::Join(JoinForm { id, url, error: String::new(), focused: false });
                 }
-                Action::Install(id) => self.start_install(ctx, &id),
-                Action::AskLauncherUpdate => {
-                    if self.job.is_none() {
-                        self.modal = Modal::LauncherUpdate
-                    }
-                }
-                Action::UpdateLauncher => self.start_launcher_update(ctx),
-                Action::CheckUpdates => self.check_now(ctx),
             }
         }
     }
@@ -683,7 +659,8 @@ impl LauncherApp {
         }
         if let Some(id) = self.selected.clone() {
             if enter {
-                self.actions.push(Action::Launch(id.clone()));
+                let a = self.primary_action(&id);
+                self.actions.push(a);
             }
             if del {
                 self.actions.push(Action::ConfirmRemove(id.clone()));
@@ -698,53 +675,37 @@ impl LauncherApp {
 
     fn header(&mut self, ctx: &egui::Context, enabled: bool) {
         let mut sort_changed = false;
-        let launcher_update = if self.launcher_dismissed { None } else { self.launcher_update().map(|r| r.version.clone()) };
+        let margin = Margin { left: 24.0, right: 24.0, top: 14.0, bottom: 17.0 };
         egui::TopBottomPanel::top("header")
-            .frame(Frame::none().fill(PANEL).inner_margin(Margin::symmetric(24.0, 14.0)))
+            .show_separator_line(false)
+            .frame(Frame::none().inner_margin(margin))
             .show(ctx, |ui| {
+                let (_, full) = textured(ui, margin, Surface::Wood, false, Color32::WHITE, |ui| {
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.horizontal(|ui| {
-                        theme::logo(ui, 30.0);
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("LAUNCHER").font(bold_font(21.0)).color(TEXT));
+                        theme::logo(ui, 38.0);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Winton").font(title_font(26.0)).color(GOLD));
                         let count = match self.data.games.len() {
                             0 => String::new(),
-                            1 => "1 jeu".into(),
-                            n => format!("{n} jeux"),
+                            1 => "· 1 jeu".into(),
+                            n => format!("· {n} jeux"),
                         };
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(count).color(SUB).size(13.0));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(count).font(heading_font(13.0)).color(SUB));
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let add = theme::filled_button("+  Ajouter un jeu", ACCENT).min_size(vec2(0.0, 36.0));
                             if ui.add(add).on_hover_text("Ctrl+N").clicked() {
                                 self.actions.push(Action::Add(None));
                             }
-
-                            // Téléchargement en cours, ou mise à jour du launcher disponible
-                            if let Some(job) = &self.job {
-                                ui.add_space(8.0);
-                                let pct = (job.progress.fraction() * 100.0).round();
-                                ui.add(
-                                    egui::ProgressBar::new(job.progress.fraction())
-                                        .desired_width(220.0)
-                                        .fill(ACCENT)
-                                        .text(format!("{} — {pct} %", job.label)),
-                                );
-                            } else if let Some(v) = &launcher_update {
-                                ui.add_space(8.0);
-                                let b = theme::filled_button(&format!("Mise à jour {v}"), PLAY).min_size(vec2(0.0, 36.0));
-                                if ui.add(b).on_hover_text("Une nouvelle version du launcher est disponible").clicked() {
-                                    self.actions.push(Action::AskLauncherUpdate);
-                                }
-                            }
-
                             ui.add_space(8.0);
+                            self.update_button(ui);
                             let resp = ui.add(
                                 TextEdit::singleline(&mut self.search)
                                     .id(egui::Id::new("search"))
                                     .hint_text("Rechercher…  (Ctrl+F)")
-                                    .desired_width(220.0)
+                                    .desired_width(240.0)
                                     .margin(vec2(10.0, 8.0)),
                             );
                             if self.focus_search {
@@ -755,8 +716,9 @@ impl LauncherApp {
                                 let (enter, esc) =
                                     ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
                                 if enter {
-                                    if let Some(id) = &self.selected {
-                                        self.actions.push(Action::Launch(id.clone()));
+                                    if let Some(id) = self.selected.clone() {
+                                        let a = self.primary_action(&id);
+                                        self.actions.push(a);
                                     }
                                 } else if esc {
                                     self.search.clear();
@@ -772,6 +734,8 @@ impl LauncherApp {
                         });
                     });
                 });
+                });
+                theme::gold_rule(ui.painter(), full.left(), full.right(), full.bottom() - 2.5);
             });
         if sort_changed {
             self.save();
@@ -780,29 +744,27 @@ impl LauncherApp {
 
     fn footer(&mut self, ctx: &egui::Context, enabled: bool) {
         let mut changed = false;
+        let margin = Margin { left: 24.0, right: 24.0, top: 9.0, bottom: 7.0 };
         egui::TopBottomPanel::bottom("footer")
-            .frame(Frame::none().fill(PANEL).inner_margin(Margin::symmetric(24.0, 7.0)))
+            .show_separator_line(false)
+            .frame(Frame::none().inner_margin(margin))
             .show(ctx, |ui| {
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&self.status).color(SUB).size(12.5));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let mut v = self.data.minimize_on_launch;
-                            let text = RichText::new("Réduire le launcher pendant que je joue").color(SUB);
-                            if ui.checkbox(&mut v, text).changed() {
-                                self.data.minimize_on_launch = v;
-                                changed = true;
-                            }
-                            ui.add_space(16.0);
-                            let label = if self.checking { "Vérification…" } else { "Vérifier les mises à jour" };
-                            let check = Button::new(RichText::new(label).color(SUB).size(12.5)).frame(false);
-                            if ui.add_enabled(!self.checking, check).clicked() {
-                                self.actions.push(Action::CheckUpdates);
-                            }
-                            ui.label(RichText::new(format!("v{}", update::VERSION)).color(SUB).size(12.5));
+                let (_, full) = textured(ui, margin, Surface::Wood, false, Color32::from_gray(165), |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&self.status).color(SUB).size(13.0));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let mut v = self.data.minimize_on_launch;
+                                let text = RichText::new("Réduire le launcher pendant que je joue").color(SUB).size(13.0);
+                                if ui.checkbox(&mut v, text).changed() {
+                                    self.data.minimize_on_launch = v;
+                                    changed = true;
+                                }
+                            });
                         });
                     });
                 });
+                theme::gold_rule(ui.painter(), full.left(), full.right(), full.top() + 2.0);
             });
         if changed {
             self.save();
@@ -810,74 +772,119 @@ impl LauncherApp {
     }
 
     fn details(&mut self, ctx: &egui::Context, enabled: bool) {
+        let margin = Margin { left: 30.0, right: 24.0, top: 24.0, bottom: 24.0 };
         egui::SidePanel::right("details")
-            .exact_width(340.0)
+            .exact_width(350.0)
             .resizable(false)
-            .frame(Frame::none().fill(PANEL).inner_margin(Margin::same(24.0)))
+            .show_separator_line(false)
+            .frame(Frame::none().inner_margin(margin))
             .show(ctx, |ui| {
+                let (_, full) = textured(ui, margin, Surface::Parchment, true, Color32::WHITE, |ui| {
+                // ombres sur les bords du parchemin
+                let r = ui.max_rect();
+                let full = Rect::from_min_max(r.min - vec2(margin.left, margin.top), r.max + vec2(margin.right, margin.bottom));
+                theme::vignette(ui.painter(), full, 40.0, 70);
                 ui.add_enabled_ui(enabled, |ui| {
                     let Some(g) = self.selected.as_deref().and_then(|id| self.game(id)).cloned() else {
                         if !self.data.games.is_empty() {
-                            ui.centered_and_justified(|ui| ui.label(RichText::new("Sélectionne un jeu").color(SUB)));
+                            ui.centered_and_justified(|ui| {
+                                ui.label(RichText::new("Choisis un jeu").font(heading_font(16.0)).color(INK_SUB))
+                            });
                         }
                         return;
                     };
                     let cover = self.tex.cover(ctx, &model::resolve(&g.cover_path));
                     let icon = self.tex.icon(ctx, &g.full_path());
                     let running = self.running.contains_key(&g.id);
-                    let new_version = self.game_update(&g).map(|r| r.version.clone());
-                    let busy = self.job.is_some();
 
                     ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                         let w = ui.available_width();
                         let (rect, _) = ui.allocate_exact_size(vec2(w, 220.0), Sense::hover());
-                        theme::paint_art(ui, rect, cover.as_ref(), icon.as_ref(), &g.initial(), 12.0, 96.0, 0.0);
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(&g.name).font(bold_font(22.0)).color(TEXT));
-                        ui.label(RichText::new(g.full_path()).color(SUB).size(11.5));
+                        ui.painter().rect_filled(rect.translate(vec2(0.0, 4.0)), 3.0, Color32::from_black_alpha(90));
+                        theme::paint_art(ui, rect, cover.as_ref(), icon.as_ref(), &g.initial(), 3.0, 96.0, 0.0);
+                        theme::ornate_frame(ui.painter(), rect, GOLD, 5.0);
                         ui.add_space(12.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new(&g.name).font(heading_font(22.0)).color(INK));
+                        });
+                        let installed = g.installed();
+                        let path_text = if installed || g.source.is_none() { g.full_path() } else { "Pas encore installé".into() };
+                        ui.add(egui::Label::new(RichText::new(&path_text).color(INK_SUB).size(11.5)).truncate())
+                            .on_hover_text(&path_text);
+                        theme::divider(ui, INK_SUB);
+                        ui.add_space(4.0);
 
-                        if let Some(v) = &new_version {
-                            let b = theme::filled_button(&format!("Mettre à jour  ({v})"), ACCENT);
-                            if ui.add_enabled(!busy, b.min_size(vec2(w, 40.0))).clicked() {
-                                self.actions.push(Action::AskInstall(g.catalog_id.clone()));
+                        let downloading = matches!(self.updates.get(&g.id), Some(Upd::Downloading { .. }));
+                        if g.joinable() {
+                            // Joueurs : on ouvre le lien du MJ. MJ : on lance le serveur (l'exe).
+                            let join = theme::grand_button(ui, vec2(w, 54.0), "Rejoindre une partie", PLAY)
+                                .on_hover_text("Colle le lien envoyé par le MJ : la partie s'ouvre dans ton navigateur.\nRien n'est installé ni lancé sur ce PC.");
+                            if join.clicked() {
+                                self.actions.push(Action::AskJoin(g.id.clone()));
                             }
-                            ui.add_space(4.0);
-                        }
-
-                        let (text, fill) = if running { ("EN COURS…", ACCENT) } else { ("▶   JOUER", PLAY) };
-                        let play = Button::new(RichText::new(text).color(Color32::WHITE).font(bold_font(17.0)))
-                            .fill(fill)
-                            .stroke(Stroke::NONE)
-                            .rounding(8.0);
-                        if ui.add_sized([w, 52.0], play).clicked() {
+                            ui.add_space(8.0);
+                            let text = if running {
+                                "Partie hébergée — en cours"
+                            } else if !installed {
+                                if downloading { "Installation…" } else { "Installer pour héberger (MJ)" }
+                            } else {
+                                "Héberger la partie (MJ)"
+                            };
+                            let host = ui
+                                .add(theme::filled_button(text, if running { RUNNING } else { ACCENT }).min_size(vec2(w, 38.0)))
+                                .on_hover_text("Réservé au MJ : ton PC devient le serveur de la partie.\nEnvoie ensuite le lien affiché aux joueurs.");
+                            if host.clicked() && !downloading {
+                                self.actions.push(Action::Launch(g.id.clone()));
+                            }
+                            if installed || downloading {
+                                ui.add_space(8.0);
+                                self.update_box(ui, &g, w);
+                            }
+                        } else {
+                        let (text, fill) = if running {
+                            ("En cours…", RUNNING)
+                        } else if g.source.is_some() && !installed {
+                            (if downloading { "Installation…" } else { "Installer" }, ACCENT)
+                        } else {
+                            ("Jouer", PLAY)
+                        };
+                        if theme::grand_button(ui, vec2(w, 54.0), text, fill).clicked() && !downloading {
                             self.actions.push(Action::Launch(g.id.clone()));
                         }
-                        ui.add_space(8.0);
+                        if g.source.is_some() {
+                            ui.add_space(8.0);
+                            self.update_box(ui, &g, w);
+                        }
+                        }
+                        ui.add_space(12.0);
 
-                        Frame::none().fill(CARD).rounding(10.0).inner_margin(Margin::symmetric(16.0, 12.0)).show(
-                            ui,
-                            |ui| {
+                        Frame::none()
+                            .fill(Color32::from_rgba_unmultiplied(0x6E, 0x48, 0x1E, 28))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0x6E, 0x52, 0x33, 120)))
+                            .rounding(2.0)
+                            .inner_margin(Margin::symmetric(14.0, 10.0))
+                            .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                let mut rows = vec![
+                                let rows = [
                                     ("Temps de jeu", model::format_duration(g.play_seconds)),
                                     ("Dernière session", g.last_played_text()),
                                     ("Ajouté le", g.added_text()),
                                 ];
-                                if !g.catalog_id.is_empty() {
-                                    rows.push(("Version", if g.version.is_empty() { "—".into() } else { g.version.clone() }));
-                                }
-                                for (k, v) in rows {
+                                for (i, (k, v)) in rows.into_iter().enumerate() {
+                                    if i > 0 {
+                                        let x = ui.max_rect().x_range();
+                                        let y = ui.cursor().top() - 1.0;
+                                        ui.painter().hline(x, y, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0x6E, 0x52, 0x33, 70)));
+                                    }
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(k).color(SUB));
+                                        ui.label(RichText::new(k).color(INK_SUB));
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            ui.label(RichText::new(v).font(bold_font(14.0)).color(TEXT));
+                                            ui.label(RichText::new(v).font(bold_font(15.0)).color(INK));
                                         });
                                     });
                                 }
-                            },
-                        );
-                        ui.add_space(8.0);
+                            });
+                        ui.add_space(10.0);
 
                         ui.horizontal(|ui| {
                             let bw = (w - 16.0) / 3.0;
@@ -898,35 +905,131 @@ impl LauncherApp {
                         });
                     });
                 });
+                });
+                // bordure gauche : poutre de bois et filet doré
+                let p = ui.painter();
+                let beam = Rect::from_min_max(full.left_top(), pos2(full.left() + 7.0, full.bottom()));
+                p.add(theme::surface_shape(Surface::Wood, beam, Color32::from_gray(150)));
+                p.vline(beam.right(), full.y_range(), Stroke::new(1.0_f32, GOLD_DIM));
+                p.vline(beam.left() + 0.5, full.y_range(), Stroke::new(1.0_f32, Color32::from_black_alpha(200)));
+                theme::horizontal_gradient(
+                    p,
+                    Rect::from_min_max(pos2(beam.right(), full.top()), pos2(beam.right() + 14.0, full.bottom())),
+                    Color32::from_black_alpha(80),
+                    Color32::TRANSPARENT,
+                );
             });
     }
 
+    /// Bouton « Mettre à jour Winton » de la barre du haut : visible dès qu'une nouvelle version
+    /// d'un jeu installé est publiée ; il installe toutes les mises à jour d'un coup.
+    fn update_button(&mut self, ui: &mut Ui) {
+        // Téléchargements en cours : progression globale à la place du bouton.
+        let (mut got, mut total, mut busy) = (0u64, 0u64, false);
+        for u in self.updates.values() {
+            if let Upd::Downloading { done, total: t, .. } = u {
+                busy = true;
+                got += done.load(SeqCst);
+                total += *t;
+            }
+        }
+        if busy {
+            let pct = if total > 0 { got * 100 / total } else { 0 };
+            ui.label(RichText::new(format!("⟳  Mise à jour… {pct} %")).font(heading_font(13.0)).color(GOLD_BRIGHT));
+            ui.ctx().request_repaint_after(Duration::from_millis(150));
+            ui.add_space(12.0);
+            return;
+        }
+        let mut lines = Vec::new();
+        for g in self.data.games.iter().filter(|g| g.installed()) {
+            if let Some(Upd::Available(r)) = self.updates.get(&g.id) {
+                let mut line = format!("• {} → {}", g.name, r.tag);
+                if !r.notes.is_empty() {
+                    line.push_str(&format!("\n   {}", r.notes.lines().next().unwrap_or_default()));
+                }
+                lines.push((g.id.clone(), line));
+            }
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let hover = format!(
+            "Nouveautés disponibles :\n{}\n\nTa configuration et tes parties sont conservées.",
+            lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+        );
+        let button = theme::filled_button("⟳  Mettre à jour Winton", GOLD).min_size(vec2(0.0, 36.0));
+        if ui.add(button).on_hover_text(hover).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+            for (id, _) in lines {
+                self.actions.push(Action::Update(id));
+            }
+        }
+        ui.add_space(8.0);
+    }
+
+    /// Version d'un jeu géré (état de sa mise à jour).
+    fn update_box(&mut self, ui: &mut Ui, g: &Game, w: f32) {
+        let version = g.source.as_ref().map(|s| s.version.clone()).unwrap_or_default();
+        let note = |ui: &mut Ui, text: String| {
+            ui.vertical_centered(|ui| ui.label(RichText::new(text).color(INK_SUB).size(12.5)));
+        };
+        match self.updates.get(&g.id) {
+            None | Some(Upd::Checking) => note(ui, "Recherche de mises à jour…".into()),
+            Some(Upd::UpToDate(tag)) => note(ui, format!("✔ À jour  ·  version {tag}")),
+            Some(Upd::NoRelease) => note(ui, "Aucune version publiée pour l'instant.".into()),
+            Some(Upd::Failed(e)) => {
+                let e = e.clone();
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(format!("⚠ {e}")).color(DANGER).size(12.5));
+                    if ui.small_button("Réessayer").clicked() {
+                        self.last_check = None;
+                    }
+                });
+            }
+            Some(Upd::Downloading { tag, done, total }) => {
+                let (got, total) = (done.load(SeqCst) as f32, (*total).max(1) as f32);
+                let frac = (got / total).clamp(0.0, 1.0);
+                let text = format!("Téléchargement {tag} · {:.0} / {:.0} Mo", got / 1e6, total / 1e6);
+                ui.add(egui::ProgressBar::new(frac).desired_width(w).text(RichText::new(text).color(TEXT).size(12.5)));
+                ui.ctx().request_repaint_after(Duration::from_millis(150));
+            }
+            Some(Upd::Available(r)) => {
+                if g.installed() {
+                    let installed = if version.is_empty() { String::new() } else { format!(" (installée : {version})") };
+                    note(ui, format!("Nouvelle version {}{installed}\n→ bouton « Mettre à jour Winton » en haut", r.tag));
+                } else {
+                    note(ui, format!("Version disponible : {}", r.tag));
+                }
+            }
+        }
+    }
+
     fn grid(&mut self, ctx: &egui::Context, enabled: bool, visible: &[usize]) {
-        let installable = self.installable();
-        egui::CentralPanel::default().frame(Frame::none().fill(BG).inner_margin(Margin::same(24.0))).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(Frame::none().inner_margin(Margin::same(24.0))).show(ctx, |ui| {
+            let r = ui.max_rect().expand(24.0);
+            ui.painter().add(theme::surface_shape(Surface::Stone, r, Color32::WHITE));
+            // lueur chaude au centre, ombre sur les bords
+            theme::vertical_gradient(
+                ui.painter(),
+                r,
+                Color32::from_rgba_unmultiplied(0x60, 0x38, 0x18, 22),
+                Color32::TRANSPARENT,
+            );
+            theme::vignette(ui.painter(), r, 90.0, 140);
             ui.add_enabled_ui(enabled, |ui| {
-                if visible.is_empty() && installable.is_empty() {
+                if visible.is_empty() {
                     self.empty_state(ui);
                     return;
                 }
                 ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
-                    if !visible.is_empty() {
+                    ui.spacing_mut().item_spacing = vec2(20.0, 20.0);
+                    // marge pour que les ornements des cadres ne soient pas rognés
+                    Frame::none().inner_margin(Margin::same(8.0)).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for &i in visible {
                                 self.card(ui, i);
                             }
                         });
-                    }
-                    if !installable.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("À installer").font(bold_font(16.0)).color(TEXT));
-                        ui.horizontal_wrapped(|ui| {
-                            for (entry, version) in &installable {
-                                self.install_card(ui, entry, version);
-                            }
-                        });
-                    }
+                    });
                 });
             });
         });
@@ -939,94 +1042,119 @@ impl LauncherApp {
             ("Aucun résultat", "Essaie un autre terme de recherche.")
         };
         ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() / 2.0 - 90.0).max(0.0));
-            let (r, _) = ui.allocate_exact_size(vec2(72.0, 72.0), Sense::hover());
-            ui.painter().rect_filled(r, 18.0, CARD);
-            theme::play_triangle(ui.painter(), r.center() + vec2(3.0, 0.0), 14.0, SUB);
-            ui.add_space(14.0);
-            ui.label(RichText::new(title).font(bold_font(20.0)).color(TEXT));
+            ui.add_space((ui.available_height() / 2.0 - 110.0).max(0.0));
+            let (r, _) = ui.allocate_exact_size(vec2(66.0, 78.0), Sense::hover());
+            theme::shield(ui.painter(), r, Color32::from_rgb(0x3A, 0x26, 0x18), GOLD_DIM);
+            theme::play_triangle(ui.painter(), r.center() + vec2(3.0, -6.0), 13.0, GOLD_DIM);
+            ui.add_space(16.0);
+            ui.label(RichText::new(title).font(heading_font(22.0)).color(GOLD));
+            let (dr, _) = ui.allocate_exact_size(vec2(280.0, 14.0), Sense::hover());
+            theme::paint_divider(ui.painter(), dr.left(), dr.right(), dr.center().y, GOLD_DIM, 5.0);
             ui.label(RichText::new(sub).color(SUB));
         });
     }
 
-    /// Bas de carte : dégradé, nom et sous-titre.
-    fn card_caption(ui: &Ui, rect: Rect, name: &str, sub: &str) {
-        let p = ui.painter();
-        let dark = Color32::from_black_alpha(225);
-        let grad_bottom = rect.bottom() - 12.0;
-        theme::vertical_gradient(
-            p,
-            Rect::from_min_max(pos2(rect.left(), rect.bottom() - 95.0), pos2(rect.right(), grad_bottom)),
-            Color32::TRANSPARENT,
-            dark,
-        );
-        p.rect_filled(
-            Rect::from_min_max(pos2(rect.left(), grad_bottom), rect.max),
-            Rounding { nw: 0.0, ne: 0.0, sw: 12.0, se: 12.0 },
-            dark,
-        );
-        let name_g = theme::truncated(ui, name, bold_font(14.0), Color32::WHITE, rect.width() - 24.0);
-        p.galley(pos2(rect.left() + 12.0, rect.bottom() - 50.0), name_g, Color32::WHITE);
-        let sub_color = Color32::from_rgb(0xB4, 0xBC, 0xCC);
-        let sub_g = theme::truncated(ui, sub, FontId::proportional(11.5), sub_color, rect.width() - 24.0);
-        p.galley(pos2(rect.left() + 12.0, rect.bottom() - 28.0), sub_g, sub_color);
-    }
-
-    fn badge(ui: &Ui, rect: Rect, text: &str, color: Color32, right: bool) {
-        let g = theme::truncated(ui, text, bold_font(10.0), Color32::WHITE, 200.0);
-        let size = g.size() + vec2(16.0, 6.0);
-        let min = if right { pos2(rect.right() - 10.0 - size.x, rect.top() + 10.0) } else { rect.min + vec2(10.0, 10.0) };
-        let br = Rect::from_min_size(min, size);
-        ui.painter().rect_filled(br, 6.0, color);
-        ui.painter().galley(br.min + vec2(8.0, 3.0), g, Color32::WHITE);
-    }
-
     fn card(&mut self, ui: &mut Ui, index: usize) {
-        let (rect, resp) = ui.allocate_exact_size(CARD_SIZE, Sense::click());
+        let size = vec2(180.0, 252.0);
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
         let g = &self.data.games[index];
         let id = g.id.clone();
 
         if ui.is_rect_visible(rect) {
             let (name, sub, initial) = (g.name.clone(), g.card_subtitle(), g.initial());
             let (cover_path, full_path) = (model::resolve(&g.cover_path), g.full_path());
-            let has_update = self.game_update(g).is_some();
             let ctx = ui.ctx().clone();
             let cover = self.tex.cover(&ctx, &cover_path);
             let icon = self.tex.icon(&ctx, &full_path);
 
-            theme::paint_art(ui, rect, cover.as_ref(), icon.as_ref(), &initial, 12.0, 80.0, -25.0);
-            Self::card_caption(ui, rect, &name, &sub);
+            ui.painter().rect_filled(rect.translate(vec2(0.0, 5.0)).expand(1.0), 4.0, Color32::from_black_alpha(130));
+            theme::paint_art(ui, rect, cover.as_ref(), icon.as_ref(), &initial, 3.0, 80.0, -25.0);
+
+            // Dégradé + plaque de nom en bas de la carte
+            let p = ui.painter();
+            let dark = Color32::from_rgba_unmultiplied(0x0E, 0x08, 0x05, 235);
+            let grad_bottom = rect.bottom() - 12.0;
+            theme::vertical_gradient(
+                p,
+                Rect::from_min_max(pos2(rect.left(), rect.bottom() - 100.0), pos2(rect.right(), grad_bottom)),
+                Color32::TRANSPARENT,
+                dark,
+            );
+            p.rect_filled(
+                Rect::from_min_max(pos2(rect.left(), grad_bottom), rect.max),
+                Rounding { nw: 0.0, ne: 0.0, sw: 3.0, se: 3.0 },
+                dark,
+            );
+            theme::paint_divider(p, rect.left() + 18.0, rect.right() - 18.0, rect.bottom() - 60.0, GOLD_DIM, 3.5);
+            let name_g = theme::truncated(ui, &name, heading_font(14.5), GOLD_BRIGHT, size.x - 24.0);
+            p.galley(pos2(rect.center().x - name_g.size().x / 2.0, rect.bottom() - 50.0), name_g, GOLD_BRIGHT);
+            let sub_color = Color32::from_rgb(0xC4, 0xAE, 0x86);
+            let sub_g = theme::truncated(ui, &sub, FontId::proportional(12.0), sub_color, size.x - 24.0);
+            p.galley(pos2(rect.center().x - sub_g.size().x / 2.0, rect.bottom() - 28.0), sub_g, sub_color);
+
             if self.running.contains_key(&id) {
-                Self::badge(ui, rect, "EN COURS", PLAY, false);
+                let badge = theme::truncated(ui, "EN COURS", heading_font(10.5), TEXT, 200.0);
+                let br = Rect::from_min_size(rect.min + vec2(12.0, 12.0), badge.size() + vec2(18.0, 8.0));
+                p.rect_filled(br, 2.0, RUNNING);
+                p.rect_stroke(br, 2.0, Stroke::new(1.0_f32, GOLD));
+                p.galley(br.min + vec2(9.0, 4.0), badge, TEXT);
             }
-            if has_update {
-                Self::badge(ui, rect, "MISE À JOUR", ACCENT, true);
+            let upd_badge = match self.updates.get(&id) {
+                Some(Upd::Downloading { .. }) => Some("TÉLÉCHARGEMENT"),
+                Some(Upd::Available(_)) if !self.data.games[index].installed() => Some("À INSTALLER"),
+                _ => None,
+            };
+            if let Some(text) = upd_badge {
+                let badge = theme::truncated(ui, text, heading_font(10.5), INK, 200.0);
+                let br = Rect::from_min_size(
+                    pos2(rect.right() - 12.0 - badge.size().x - 18.0, rect.top() + 12.0),
+                    badge.size() + vec2(18.0, 8.0),
+                );
+                p.rect_filled(br, 2.0, GOLD_BRIGHT);
+                p.rect_stroke(br, 2.0, Stroke::new(1.0_f32, Color32::from_rgb(0x5E, 0x44, 0x1C)));
+                p.galley(br.min + vec2(9.0, 4.0), badge, INK);
             }
         }
 
         let circle = rect.center() - vec2(0.0, 20.0);
-        let on_circle = resp.hover_pos().is_some_and(|pos| pos.distance(circle) <= 29.0);
+        let on_circle = resp.hover_pos().is_some_and(|pos| pos.distance(circle) <= 30.0);
+        let selected = self.selected.as_deref() == Some(id.as_str());
         if resp.hovered() {
             let p = ui.painter();
-            p.rect_filled(rect, 12.0, Color32::from_black_alpha(64));
-            let fill = if on_circle { Color32::from_rgb(0x3D, 0xD6, 0x84) } else { PLAY };
-            p.circle_filled(circle, 29.0, fill);
-            theme::play_triangle(p, circle + vec2(2.0, 0.0), 11.0, Color32::WHITE);
+            p.rect_filled(rect, 3.0, Color32::from_black_alpha(70));
+            theme::wax_seal(p, circle, 30.0, on_circle);
         }
-        if self.selected.as_deref() == Some(id.as_str()) {
-            ui.painter().rect_stroke(rect.shrink(1.5), 12.0, Stroke::new(3.0_f32, ACCENT));
+        if ui.is_rect_visible(rect) {
+            let p = ui.painter();
+            let gold = if selected {
+                GOLD_BRIGHT
+            } else if resp.hovered() {
+                GOLD
+            } else {
+                GOLD_DIM
+            };
+            if selected {
+                p.rect_stroke(rect.expand(3.0), 4.0, Stroke::new(3.0_f32, Color32::from_rgba_unmultiplied(0xF2, 0xD2, 0x7C, 70)));
+            }
+            theme::ornate_frame(p, rect, gold, 4.5);
         }
 
         let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         if resp.double_clicked() || (resp.clicked() && on_circle) {
             self.actions.push(Action::Select(id.clone()));
-            self.actions.push(Action::Launch(id.clone()));
+            let a = self.primary_action(&id);
+            self.actions.push(a);
         } else if resp.clicked() || resp.secondary_clicked() {
             self.actions.push(Action::Select(id.clone()));
         }
+        let joinable = self.data.games[index].joinable();
         resp.context_menu(|ui| {
+            if joinable && ui.button("Rejoindre une partie…").clicked() {
+                self.actions.push(Action::AskJoin(id.clone()));
+                ui.close_menu();
+            }
             let items = [
-                ("Jouer", Action::Launch(id.clone())),
+                (if joinable { "Héberger la partie (MJ)" } else { "Jouer" }, Action::Launch(id.clone())),
                 ("Modifier…", Action::Edit(id.clone())),
                 ("Ouvrir l'emplacement du jeu", Action::Folder(id.clone())),
                 ("Retirer du launcher", Action::ConfirmRemove(id.clone())),
@@ -1040,33 +1168,6 @@ impl LauncherApp {
         });
     }
 
-    /// Carte d'un jeu du catalogue pas encore installé.
-    fn install_card(&mut self, ui: &mut Ui, entry: &CatalogEntry, version: &str) {
-        let (rect, resp) = ui.allocate_exact_size(CARD_SIZE, Sense::click());
-        if ui.is_rect_visible(rect) {
-            theme::paint_art(ui, rect, None, None, &model::initial_of(&entry.name), 12.0, 80.0, -25.0);
-            Self::card_caption(ui, rect, &entry.name, &format!("Version {version} — à installer"));
-        }
-        if resp.hovered() {
-            let p = ui.painter();
-            p.rect_filled(rect, 12.0, Color32::from_black_alpha(64));
-            let c = rect.center() - vec2(0.0, 20.0);
-            p.circle_filled(c, 29.0, ACCENT);
-            // flèche « télécharger »
-            p.line_segment([c + vec2(0.0, -12.0), c + vec2(0.0, 6.0)], Stroke::new(3.0_f32, Color32::WHITE));
-            p.add(egui::Shape::convex_polygon(
-                vec![c + vec2(-8.0, 2.0), c + vec2(8.0, 2.0), c + vec2(0.0, 12.0)],
-                Color32::WHITE,
-                Stroke::NONE,
-            ));
-        }
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        let resp = if entry.description.is_empty() { resp } else { resp.on_hover_text(&entry.description) };
-        if resp.clicked() {
-            self.actions.push(Action::AskInstall(entry.id.clone()));
-        }
-    }
-
     // ------------------------------------------------------------------ fenêtres modales
 
     fn show_modal(&mut self, ctx: &egui::Context) {
@@ -1074,13 +1175,10 @@ impl LauncherApp {
         let keep = match &mut modal {
             Modal::None => false,
             Modal::Edit(f) => self.edit_window(ctx, f),
+            Modal::Join(f) => self.join_window(ctx, f),
             Modal::ConfirmRemove(id) => {
-                let (name, catalog) = self.game(id).map(|g| (g.name.clone(), !g.catalog_id.is_empty())).unwrap_or_default();
-                let text = if catalog {
-                    format!("Désinstaller « {name} » ?\n\nSes fichiers seront supprimés du dossier Jeux.\nSes sauvegardes sont conservées.")
-                } else {
-                    format!("Retirer « {name} » du launcher ?\n\nLe jeu lui-même ne sera pas supprimé de ton disque.")
-                };
+                let name = self.game(id).map(|g| g.name.clone()).unwrap_or_default();
+                let text = format!("Retirer « {name} » du launcher ?\n\nLe jeu lui-même ne sera pas supprimé de ton disque.");
                 self.confirm(ctx, "Retirer le jeu", &text, "Retirer", DANGER, Action::Remove(id.clone()))
             }
             Modal::Missing(id) => {
@@ -1097,41 +1195,6 @@ impl LauncherApp {
                 let (title, text) = (title.clone(), text.clone());
                 self.message(ctx, &title, &text)
             }
-            Modal::InstallGame(id) => {
-                let id = id.clone();
-                match (self.catalog_entry(&id).cloned(), self.release(&id).cloned()) {
-                    (Some(entry), Some(release)) => {
-                        let installed = self.data.games.iter().find(|g| g.catalog_id == id).map(|g| g.version.clone());
-                        let (title, ok, intro) = match &installed {
-                            Some(v) => (
-                                "Mettre à jour",
-                                "Mettre à jour",
-                                format!("{} {} → {}", entry.name, if v.is_empty() { "?" } else { v }, release.version),
-                            ),
-                            None => ("Installer", "Installer", format!("{} {}", entry.name, release.version)),
-                        };
-                        let text = notes_text(&intro, &release.notes);
-                        self.confirm(ctx, title, &text, ok, ACCENT, Action::Install(id))
-                    }
-                    _ => false,
-                }
-            }
-            Modal::LauncherUpdate => match self.launcher_update().cloned() {
-                Some(release) => {
-                    let intro = format!(
-                        "Nouvelle version du launcher : {} (tu as la {}).\nLe launcher redémarrera tout seul.",
-                        release.version,
-                        update::VERSION
-                    );
-                    let text = notes_text(&intro, &release.notes);
-                    let keep = self.confirm(ctx, "Mise à jour du launcher", &text, "Installer et redémarrer", PLAY, Action::UpdateLauncher);
-                    if !keep && !matches!(self.actions.last(), Some(Action::UpdateLauncher)) {
-                        self.launcher_dismissed = true; // « Plus tard »
-                    }
-                    keep
-                }
-                None => false,
-            },
         };
         if keep && matches!(self.modal, Modal::None) {
             self.modal = modal;
@@ -1149,12 +1212,9 @@ impl LauncherApp {
     ) -> bool {
         let (enter, esc) = ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
         let (mut accepted, mut cancelled) = (enter, esc);
-        modal_window(ctx, "confirm", 460.0, |ui| {
-            ui.label(RichText::new(title).font(bold_font(18.0)).color(TEXT));
-            ui.add_space(6.0);
-            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                ui.label(RichText::new(text).color(TEXT));
-            });
+        modal_window(ctx, "confirm", 440.0, |ui| {
+            modal_title(ui, title);
+            ui.label(RichText::new(text).color(TEXT));
             ui.add_space(16.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::filled_button(ok, ok_color).min_size(vec2(110.0, 34.0))).clicked() {
@@ -1175,8 +1235,7 @@ impl LauncherApp {
     fn message(&mut self, ctx: &egui::Context, title: &str, text: &str) -> bool {
         let mut close = ctx.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape));
         modal_window(ctx, "message", 440.0, |ui| {
-            ui.label(RichText::new(title).font(bold_font(18.0)).color(TEXT));
-            ui.add_space(6.0);
+            modal_title(ui, title);
             ui.label(RichText::new(text).color(TEXT));
             ui.add_space(16.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1188,6 +1247,59 @@ impl LauncherApp {
         !close
     }
 
+    fn join_window(&mut self, ctx: &egui::Context, f: &mut JoinForm) -> bool {
+        let (enter, esc) = ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+        let mut keep = !esc;
+        let mut go = enter;
+        let name = self.game(&f.id).map(|g| g.name.clone()).unwrap_or_default();
+        modal_window(ctx, "join", 520.0, |ui| {
+            modal_title(ui, "Rejoindre une partie");
+            ui.label(
+                RichText::new(format!(
+                    "Colle le lien de la partie « {name} » envoyé par le MJ (Discord, SMS…).\n\
+                     Elle s'ouvrira dans ton navigateur : ton PC n'héberge rien."
+                ))
+                .color(TEXT),
+            );
+            field_label(ui, "Lien de la partie");
+            let resp = ui.add(
+                TextEdit::singleline(&mut f.url)
+                    .hint_text("https://xxxx.trycloudflare.com")
+                    .desired_width(f32::INFINITY)
+                    .margin(vec2(10.0, 8.0)),
+            );
+            if !f.focused {
+                resp.request_focus();
+                f.focused = true;
+            }
+            if resp.changed() {
+                f.error.clear();
+            }
+            ui.label(
+                RichText::new("Le lien change à chaque séance : demande le nouveau au MJ s'il ne marche plus.")
+                    .color(SUB)
+                    .size(12.5),
+            );
+            if !f.error.is_empty() {
+                ui.add_space(8.0);
+                ui.label(RichText::new(&f.error).color(DANGER));
+            }
+            ui.add_space(16.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(theme::filled_button("Rejoindre", PLAY).min_size(vec2(130.0, 36.0))).clicked() {
+                    go = true;
+                }
+                if ui.add(Button::new("Annuler").min_size(vec2(110.0, 36.0))).clicked() {
+                    keep = false;
+                }
+            });
+        });
+        if keep && go && self.join(f) {
+            keep = false;
+        }
+        keep
+    }
+
     fn edit_window(&mut self, ctx: &egui::Context, f: &mut EditForm) -> bool {
         let (enter, esc) = ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
         let mut keep = !esc;
@@ -1197,18 +1309,17 @@ impl LauncherApp {
         let title = if f.existing.is_some() { "Modifier le jeu" } else { "Ajouter un jeu" };
 
         modal_window(ctx, "edit", 600.0, |ui| {
-            ui.label(RichText::new(title).font(bold_font(20.0)).color(TEXT));
-            ui.add_space(8.0);
+            modal_title(ui, title);
             ui.horizontal_top(|ui| {
                 // Jaquette
                 ui.vertical(|ui| {
-                    ui.set_width(140.0);
+                    ui.set_width(160.0);
                     ui.add_space(10.0);
-                    let (rect, _) = ui.allocate_exact_size(vec2(140.0, 196.0), Sense::hover());
+                    let (rect, _) = ui.allocate_exact_size(vec2(160.0, 224.0), Sense::hover());
                     let initial = model::initial_of(&f.name);
                     theme::paint_art(ui, rect, cover.as_ref(), icon.as_ref(), &initial, 10.0, 64.0, -5.0);
                     ui.add_space(4.0);
-                    if ui.add_sized([140.0, 30.0], Button::new("Choisir une image…")).clicked() {
+                    if ui.add_sized([160.0, 30.0], Button::new(RichText::new("Choisir une image…").font(heading_font(12.0)))).clicked() {
                         let picked = rfd::FileDialog::new()
                             .set_title("Choisir une jaquette")
                             .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "gif", "webp", "ico"])
@@ -1223,7 +1334,7 @@ impl LauncherApp {
                             }
                         }
                     }
-                    let remove = theme::danger_button("Retirer l'image").min_size(vec2(140.0, 30.0));
+                    let remove = theme::danger_button("Retirer l'image").min_size(vec2(160.0, 30.0));
                     if ui.add_enabled(!f.cover.is_empty(), remove).clicked() {
                         f.cover.clear();
                     }
@@ -1301,33 +1412,41 @@ impl LauncherApp {
     }
 }
 
-/// Texte d'une fenêtre d'installation : en-tête + notes de version (si publiées).
-fn notes_text(intro: &str, notes: &str) -> String {
-    if notes.trim().is_empty() {
-        intro.to_string()
-    } else {
-        format!("{intro}\n\nNouveautés :\n{}", notes.trim())
-    }
-}
-
 fn field_label(ui: &mut Ui, text: &str) {
     ui.add_space(4.0);
-    ui.label(RichText::new(text).color(SUB).size(12.0));
+    ui.label(RichText::new(text).color(SUB).size(13.0));
+}
+
+/// Titre de fenêtre : capitales dorées et séparateur orné.
+fn modal_title(ui: &mut Ui, title: &str) {
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new(title).font(heading_font(21.0)).color(GOLD_BRIGHT));
+    });
+    theme::divider(ui, GOLD_DIM);
+    ui.add_space(4.0);
 }
 
 fn modal_window<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mut Ui) -> R) -> Option<R> {
-    egui::Window::new(id)
+    let shown = egui::Window::new(id)
         .id(egui::Id::new(id))
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-        .frame(Frame::window(&ctx.style()).fill(BG).inner_margin(Margin::same(24.0)).rounding(12.0))
+        .frame(Frame::window(&ctx.style()).fill(theme::CARD).stroke(Stroke::NONE).inner_margin(Margin::same(28.0)).rounding(3.0))
         .show(ctx, |ui| {
             ui.set_width(width);
-            add(ui)
-        })
-        .and_then(|r| r.inner)
+            // Emplacement réservé pour le fond, rempli une fois la taille de la fenêtre connue.
+            let idx = ui.painter().add(Shape::Noop);
+            (add(ui), ui.layer_id(), idx)
+        })?;
+    let (r, layer, idx) = shown.inner?;
+    let full = shown.response.rect;
+    let mut shapes = vec![theme::surface_shape(Surface::Stone, full, Color32::WHITE)];
+    shapes.push(Shape::rect_filled(full, 0.0, Color32::from_rgba_unmultiplied(0x6A, 0x40, 0x1C, 40)));
+    shapes.extend(theme::ornate_frame_shapes(full.shrink(6.0), GOLD, 5.0));
+    ctx.graphics_mut(|g| g.entry(layer).set(idx, full, Shape::Vec(shapes)));
+    Some(r)
 }
 
 // ------------------------------------------------------------------ boucle principale
@@ -1338,8 +1457,11 @@ impl eframe::App for LauncherApp {
             self.hwnd.store(win::own_window(), SeqCst);
         }
         self.poll_finished();
-        self.poll_updates(ctx);
-        self.maybe_check(ctx);
+        self.poll_updates();
+        if self.last_check.map_or(true, |t| t.elapsed() >= UPDATE_CHECK_EVERY) {
+            self.check_updates(ctx);
+        }
+        ctx.request_repaint_after(Duration::from_secs(60));
         self.handle_drops(ctx);
 
         let modal_open = !matches!(self.modal, Modal::None);
@@ -1368,9 +1490,9 @@ impl eframe::App for LauncherApp {
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop")));
             let r = ctx.screen_rect().shrink(12.0);
-            p.rect_filled(r, 16.0, Color32::from_rgba_unmultiplied(0x5B, 0x8C, 0xFF, 40));
-            p.rect_stroke(r, 16.0, Stroke::new(2.0_f32, ACCENT));
-            p.text(r.center(), Align2::CENTER_CENTER, "Dépose ici pour ajouter le jeu", bold_font(22.0), TEXT);
+            p.rect_filled(r, 3.0, Color32::from_rgba_unmultiplied(0x14, 0x0C, 0x06, 200));
+            theme::ornate_frame(&p, r, GOLD, 7.0);
+            p.text(r.center(), Align2::CENTER_CENTER, "Dépose ici pour ajouter le jeu", heading_font(26.0), GOLD_BRIGHT);
         }
 
         self.process_actions(ctx);

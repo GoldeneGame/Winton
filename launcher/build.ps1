@@ -1,4 +1,4 @@
-﻿# Compile le launcher et copie Launcher.exe dans ..\dist
+# Compile Winton et copie Winton.exe à la racine du projet (..\Winton.exe)
 # Usage : clic droit > Exécuter avec PowerShell, ou  .\build.ps1  depuis ce dossier.
 Set-Location $PSScriptRoot
 
@@ -10,6 +10,5 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$mingw;$env:PATH"
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "La compilation a échoué." }
 
-New-Item -ItemType Directory -Force ..\dist | Out-Null
-Copy-Item target\release\launcher.exe ..\dist\Launcher.exe -Force
-Write-Host "OK -> $((Resolve-Path ..\dist\Launcher.exe).Path)"
+Copy-Item target\release\winton.exe ..\Winton.exe -Force
+Write-Host "OK -> $((Resolve-Path ..\Winton.exe).Path)"

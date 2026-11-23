@@ -1,9 +1,8 @@
 [package]
-name = "launcher"
+name = "winton"
 version = "1.0.0"
 edition = "2021"
-description = "Launcher de jeux Winton"
-repository = "https://github.com/GoldeneGame/Winton"
+description = "Winton, launcher de jeux"
 
 [dependencies]
 eframe = "=0.29.1"
@@ -12,14 +11,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "ico"] }
 rfd = "0.15"
-# Mises à jour (même principe que Ronnie : SHA-256 + signature Ed25519, remplacement de l'exe)
-ureq = { version = "2.10", default-features = false, features = ["json", "native-tls"] }
-native-tls = "0.2"
-sha2 = "0.10"
-ed25519-dalek = "2.1"
-base64 = "0.22"
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
-self-replace = "1.5"
+ureq = "2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

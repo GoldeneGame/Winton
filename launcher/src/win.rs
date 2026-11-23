@@ -13,7 +13,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
     BI_RGB, DIB_RGB_COLORS,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenProcess, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::Threading::{GetCurrentThreadId, WaitForSingleObject, INFINITE};
 use windows_sys::Win32::UI::Shell::{
     SHDefExtractIconW, SHGetFileInfoW, ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS,
     SHELLEXECUTEINFOW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
@@ -53,18 +53,6 @@ pub fn wait_and_close(process: isize) {
     unsafe {
         WaitForSingleObject(process as HANDLE, INFINITE);
         CloseHandle(process as HANDLE);
-    }
-}
-
-/// Attend (au plus `timeout_ms`) la fin d'un processus.
-pub fn wait_for_process(pid: u32, timeout_ms: u32) {
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    unsafe {
-        let h = OpenProcess(SYNCHRONIZE, 0, pid);
-        if !h.is_null() {
-            WaitForSingleObject(h, timeout_ms);
-            CloseHandle(h);
-        }
     }
 }
 

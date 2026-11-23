@@ -1,5 +1,5 @@
 //! Données du launcher : jeux, chemins, sauvegarde sur disque.
-//! Le format JSON est identique à celui de l'ancienne version (LauncherData\launcher.json).
+//! Le format JSON est identique à celui de l'ancienne version (LauncherData\launcher.json, désormais WintonData).
 
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -23,10 +23,85 @@ pub struct Game {
     #[serde(with = "date")]
     pub last_played: Option<NaiveDateTime>,
     pub play_seconds: f64,
-    /// Identifiant dans catalogue.json pour un jeu installé depuis le dépôt ("" = jeu ajouté à la main).
-    pub catalog_id: String,
-    /// Version installée (jeux du catalogue).
+    /// Jeu installé et mis à jour par Winton depuis les releases d'un dépôt GitHub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+    /// Dernier lien de partie collé dans « Rejoindre » (jeux en ligne hébergés par le MJ).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub join_url: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct Source {
+    /// Dépôt GitHub « propriétaire/nom ».
+    pub repo: String,
+    /// Fichier de la release à installer (ex. LaTaverne.exe).
+    pub asset: String,
+    /// Version installée (tag de la release) ; vide tant que Winton ne l'a pas installée lui-même.
     pub version: String,
+}
+
+/// Jeux que Winton récupère et tient à jour tout seul.
+pub struct Managed {
+    pub repo: &'static str,
+    pub asset: &'static str,
+    pub name: &'static str,
+    /// Jeu hébergé par un joueur (le MJ) : les autres le rejoignent par un lien, sans lancer l'exe.
+    pub joinable: bool,
+}
+
+pub const MANAGED: &[Managed] =
+    &[Managed { repo: "GoldeneGame/JDR", asset: "LaTaverne.exe", name: "La Taverne", joinable: true }];
+
+/// Normalise un lien de partie collé par le joueur. Seules les adresses web sont acceptées
+/// (jamais file://, ni un chemin d'exe) : le lien est ouvert dans le navigateur par défaut.
+pub fn parse_join_url(input: &str) -> Result<String, String> {
+    let s = input.trim().trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>').trim();
+    if s.is_empty() {
+        return Err("Colle le lien envoyé par le MJ.".into());
+    }
+    let lower = s.to_ascii_lowercase();
+    let url = if lower.starts_with("https://") || lower.starts_with("http://") {
+        s.to_string()
+    } else if lower.contains("://") {
+        return Err("Ce n'est pas un lien web : il doit commencer par https:// ou http://.".into());
+    } else if lower.contains("trycloudflare.com") {
+        format!("https://{s}")
+    } else {
+        format!("http://{s}")
+    };
+    let host = url.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+    let host_ok = !host.is_empty()
+        && host.contains(['.', ':'])
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    if !host_ok || url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') {
+        return Err("Ce lien n'est pas valide. Exemple : https://xxxx.trycloudflare.com".into());
+    }
+    Ok(url)
+}
+
+/// Ajoute à la bibliothèque les jeux gérés qui n'y sont pas encore. Un jeu déjà présent
+/// (même nom d'exe) est rattaché à son dépôt plutôt que dupliqué. Renvoie true si quelque chose a changé.
+pub fn attach_managed(data: &mut LauncherData) -> bool {
+    let mut changed = false;
+    for m in MANAGED {
+        let known = data.games.iter().any(|g| g.source.as_ref().is_some_and(|s| s.repo.eq_ignore_ascii_case(m.repo)));
+        if known || data.removed_managed.iter().any(|r| r.eq_ignore_ascii_case(m.repo)) {
+            continue;
+        }
+        let source = Source { repo: m.repo.into(), asset: m.asset.into(), version: String::new() };
+        let same_exe = data.games.iter_mut().find(|g| {
+            g.source.is_none()
+                && Path::new(&g.path).file_name().is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(m.asset))
+        });
+        match same_exe {
+            Some(g) => g.source = Some(source),
+            None => data.games.push(Game { name: m.name.into(), source: Some(source), ..Default::default() }),
+        }
+        changed = true;
+    }
+    changed
 }
 
 impl Default for Game {
@@ -41,15 +116,26 @@ impl Default for Game {
             added_at: Some(now()),
             last_played: None,
             play_seconds: 0.0,
-            catalog_id: String::new(),
-            version: String::new(),
+            source: None,
+            join_url: String::new(),
         }
     }
 }
 
 impl Game {
+    /// Jeu en ligne qu'on peut rejoindre par un lien (La Taverne).
+    pub fn joinable(&self) -> bool {
+        self.source.as_ref().is_some_and(|s| MANAGED.iter().any(|m| m.joinable && m.repo.eq_ignore_ascii_case(&s.repo)))
+    }
+
     pub fn full_path(&self) -> String {
         resolve(&self.path)
+    }
+
+    /// Le fichier du jeu est présent (toujours vrai pour un lien).
+    pub fn installed(&self) -> bool {
+        let p = self.full_path();
+        !p.is_empty() && (is_uri(&p) || Path::new(&p).is_file())
     }
 
     pub fn initial(&self) -> String {
@@ -93,11 +179,14 @@ pub struct LauncherData {
     pub minimize_on_launch: bool,
     pub sort: String,
     pub games: Vec<Game>,
+    /// Jeux gérés (dépôts) que l'utilisateur a retirés : ne pas les rajouter.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_managed: Vec<String>,
 }
 
 impl Default for LauncherData {
     fn default() -> Self {
-        LauncherData { minimize_on_launch: true, sort: "name".into(), games: Vec::new() }
+        LauncherData { minimize_on_launch: true, sort: "name".into(), games: Vec::new(), removed_managed: Vec::new() }
     }
 }
 
@@ -204,7 +293,12 @@ pub struct Store {
 
 impl Store {
     pub fn new() -> Self {
-        let local = base_dir().join("LauncherData");
+        let local = base_dir().join("WintonData");
+        // Ancien nom du dossier de données : on le reprend tel quel.
+        let old = base_dir().join("LauncherData");
+        if !local.exists() && old.is_dir() {
+            let _ = fs::rename(&old, &local);
+        }
         let writable = fs::create_dir_all(&local).is_ok() && {
             let probe = local.join(".write-test");
             let ok = fs::write(&probe, b"").is_ok();
@@ -216,7 +310,11 @@ impl Store {
         }
         // Dossier protégé (ex. Program Files) : on se rabat sur %APPDATA%.
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        let dir = appdata.join("GameLauncher");
+        let dir = appdata.join("Winton");
+        let old = appdata.join("GameLauncher");
+        if !dir.exists() && old.is_dir() {
+            let _ = fs::rename(&old, &dir);
+        }
         let _ = fs::create_dir_all(&dir);
         Store { dir }
     }
@@ -229,12 +327,9 @@ impl Store {
         self.dir.join("covers")
     }
 
-    /// Dossier où sont installés les jeux du catalogue (Jeux\ à côté de LauncherData\).
-    pub fn games_dir(&self) -> PathBuf {
-        match self.dir.parent() {
-            Some(parent) if self.dir.file_name().is_some_and(|n| n == "LauncherData") => parent.join("Jeux"),
-            _ => self.dir.join("Jeux"), // repli dans %APPDATA%\GameLauncher
-        }
+    /// Dossier d'installation d'un jeu géré : WintonData\jeux\<nom du dépôt>.
+    pub fn game_dir(&self, repo: &str) -> PathBuf {
+        self.dir.join("jeux").join(repo.rsplit('/').next().unwrap_or(repo))
     }
 
     /// Renvoie les données et un éventuel avertissement à afficher.
@@ -244,7 +339,17 @@ impl Store {
             return (LauncherData::default(), None);
         };
         match serde_json::from_str::<LauncherData>(text.trim_start_matches('\u{feff}')) {
-            Ok(d) => (d, None),
+            Ok(mut d) => {
+                // Jaquettes enregistrées sous l'ancien nom du dossier de données.
+                for g in &mut d.games {
+                    for (old, new) in [("LauncherData\\", "WintonData\\"), ("\\LauncherData\\", "\\WintonData\\"), ("\\GameLauncher\\", "\\Winton\\")] {
+                        if g.cover_path.starts_with(old) || (old.starts_with('\\') && g.cover_path.contains(old)) {
+                            g.cover_path = g.cover_path.replacen(old, new, 1);
+                        }
+                    }
+                }
+                (d, None)
+            }
             Err(e) => {
                 let backup = self.dir.join("launcher.json.corrompu.bak");
                 let _ = fs::copy(&file, &backup);
@@ -266,7 +371,7 @@ impl Store {
         fs::rename(&tmp, self.file())
     }
 
-    /// Copie la jaquette choisie dans LauncherData\covers pour qu'elle ne se perde pas.
+    /// Copie la jaquette choisie dans WintonData\covers pour qu'elle ne se perde pas.
     pub fn import_cover(&self, source: &str, game_id: &str) -> io::Result<String> {
         fs::create_dir_all(self.covers_dir())?;
         let ext = Path::new(source)
@@ -319,5 +424,24 @@ mod date {
             return Some(dt.with_timezone(&Local).naive_local());
         }
         NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_join_url as p;
+
+    #[test]
+    fn liens_de_partie() {
+        assert_eq!(p("https://abc-def.trycloudflare.com").unwrap(), "https://abc-def.trycloudflare.com");
+        assert_eq!(p("  abc.trycloudflare.com/ ").unwrap(), "https://abc.trycloudflare.com/");
+        assert_eq!(p("\"http://192.168.1.147:3000\"").unwrap(), "http://192.168.1.147:3000");
+        assert_eq!(p("192.168.1.147:3000").unwrap(), "http://192.168.1.147:3000");
+        assert!(p("").is_err());
+        assert!(p("file:///C:/Windows/System32/cmd.exe").is_err());
+        assert!(p(r"C:\jeux\LaTaverne.exe").is_err());
+        assert!(p("https://").is_err());
+        assert!(p("https://a b.com").is_err());
+        assert!(p("bonjour").is_err());
     }
 }
