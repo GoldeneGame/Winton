@@ -19,3 +19,7 @@ cloudflared.exe
 # Clés : la clé privée de signature ne doit JAMAIS être dans le dépôt
 *.pem
 *.key
+
+# Winton : exe compilé et données locales (bibliothèque, jeux installés)
+/Winton.exe
+WintonData/
